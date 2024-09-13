@@ -1,0 +1,608 @@
+---
+title: "Figure 3"
+author: ""
+date: ""
+output: 
+  html_document:
+    fig_height: 3
+    fig_width: 5
+  pdf_document:
+    fig_height: 3
+    fig_width: 5
+  word_document:
+    fig_height: 3
+    fig_width: 5
+---
+
+# Setup
+```{r, setup, message=FALSE, warning=FALSE}
+## Load in datasets
+source("/scratch/ucgd/lustre-labs/quinlan/u1240855/normo-vs-oligo/R/normo-vs-oligo-data-setup.r")
+setup_list <- setup_data()
+
+sample_metadata_complete <- setup_list$sample_metadata_complete
+main_samples_metadata <- setup_list$main_samples_metadata
+donor_table <- setup_list$donor_table
+
+mutations_filtered <- setup_list$mutations_filtered
+
+sample_coverage <- setup_list$sample_coverage
+sample_coverage_interval <- setup_list$sample_coverage_interval
+
+main_figure_dir <- setup_list$main_figure_dir
+supplementary_figure_dir <- setup_list$supplementary_figure_dir
+```
+
+## Sperm mutations
+```{r, message=FALSE}
+main_samples <- main_samples_metadata$sample
+
+## Sperm mutations
+sperm.mutations_filtered <- mutations_filtered %>%
+  filter(tissue == "Sperm_DNA" & sample %in% main_samples) %>%
+  left_join(., main_samples_metadata[,c("sample", "avgMotil", "sperm_concentration", 
+                                        "MedianInsertSize", "years_since_collection", "protocol")], by = "sample") %>%
+  data.table()
+
+## Remove C>Ts (non-CpG>TpG)
+sperm.mutations_filtered.no_CtoT <- sperm.mutations_filtered %>%
+  filter(!(subtype_collapsed %in% c("C>T"))) %>%
+  data.table()
+
+## Only use donors with matched sperm and blood
+matched_donors <- donor_table[`Sperm Used?` == "Yes" & `Blood Used?` == "Yes"]$`Donor ID`
+sperm.mutations.matched_donors <- sperm.mutations_filtered %>%
+  filter(donor_id %in% matched_donors) %>%
+  data.table()
+```
+
+## Calculate sperm mutation frequencies
+```{r, message=FALSE}
+calc_mutation_frequency <- function(df, sample_coverage_df) {
+  mr_df <- df %>%
+    left_join(., sample_coverage_df[,c("sample", "total_depth")], by = c("sample")) %>%
+    group_by(donor_id, donor_label, tissue, age, timepoint, cohort, sperm_concentration,
+             fertility_status, avgMotil, years_since_collection, genomex_id) %>%
+    summarise(n_var = n_distinct(var_coord), 
+              depth = sum(unique(total_depth)), 
+              median_insert_size = median(MedianInsertSize)) %>%
+    mutate(n_var_lower = qchisq(0.025, 2*n_var)/2,
+           n_var_upper = qchisq(0.975, 2*(n_var + 1))/2) %>%
+    mutate(mutation_rate = n_var / depth,
+           mutation_rate_lower = n_var_lower / depth,
+           mutation_rate_upper = n_var_upper / depth, 
+           age_adjusted_mutation_rate = mutation_rate / age) %>%
+    data.table()
+  return(mr_df)    
+}
+
+calc_panel_mutation_frequency <- function(df, sample_coverage_interval_df) {
+  sample_panel_cov <- sample_coverage_interval %>%
+    mutate(panel = ifelse(gene == "neutral_region", yes = "Control", no = "Custom")) %>%
+    group_by(sample, panel) %>%
+    summarise(panel_cov = sum(coverage)) %>%
+    data.table()
+
+  panel_mr <- df %>%
+    mutate(panel = ifelse(panel == "custom", yes = "Custom", no = "Control")) %>%
+    left_join(., sample_panel_cov, by = c("sample", "panel")) %>%
+    group_by(donor_id, donor_label, tissue, age, timepoint, cohort, sperm_concentration,
+             fertility_status, avgMotil, years_since_collection, genomex_id, panel) %>%
+    summarise(n_var = n_distinct(var_coord), 
+              depth = sum(unique(panel_cov))) %>%
+    mutate(n_var_lower = qchisq(0.025, 2*n_var)/2,
+           n_var_upper = qchisq(0.975, 2*(n_var + 1))/2) %>%
+    mutate(mutation_rate = n_var / depth,
+           mutation_rate.lower = n_var_lower / depth,
+           mutation_rate.upper = n_var_upper / depth) %>%
+    mutate(age_adjusted_mutation_rate = mutation_rate / age, 
+           age_adjusted_mutation_rate.lower = mutation_rate.lower / age,
+           age_adjusted_mutation_rate.upper = mutation_rate.upper / age) %>%
+    mutate(motility_status = ifelse(avgMotil < 40, yes = "Low", no = "Normal")) %>%
+    group_by(donor_id, donor_label, tissue) %>%
+    mutate(num_panels_with_mutations = n_distinct(panel)) %>%
+    mutate(panel = factor(panel, levels = c("Control", "Custom"))) %>%
+    data.table()  
+
+  ## Use 0 when no mutations are found in a sample's panel
+  copy <- panel_mr[num_panels_with_mutations == 1] %>%
+    mutate(panel = "Control") %>% ## assumes mutations were found in the custom panel
+    mutate(age_adjusted_mutation_rate = 0, 
+           age_adjusted_mutation_rate.lower = 0, 
+           age_adjusted_mutation_rate.upper = 0) %>%
+    data.table()
+  panel_mr <- rbind(panel_mr, copy) %>% data.table()  
+
+  return(panel_mr)    
+}
+
+## Overall mutation frequency per sample
+sample_coverage.filtered <- sample_coverage[probe_filter_threshold == "all_intervals.all_filters.baseline_remove_recurrence"]
+sperm.mr_df <- calc_mutation_frequency(sperm.mutations_filtered, sample_coverage_df = sample_coverage.filtered)
+sperm.mr_df.no_CtoT <- calc_mutation_frequency(sperm.mutations_filtered.no_CtoT, sample_coverage_df = sample_coverage.filtered)
+sperm.mr_df.matched_donors <- calc_mutation_frequency(sperm.mutations.matched_donors, sample_coverage_df = sample_coverage.filtered)
+
+## Panel specific mutation frequency per sample
+sample_interval_coverage.filtered <- sample_coverage_interval[filter == "postfilter_remove_recurrence"]
+sperm.panel.mr_df <- calc_panel_mutation_frequency(sperm.mutations_filtered, sample_coverage_interval_df = sample_interval_coverage.filtered)
+```
+
+# Generate regression model {.tabset}
+## Function to model data
+```{r, message=FALSE}
+generate_regressions <- function(model_df, family) {
+
+  if (family == "Poisson") {
+    ## Poisson regressions in fertile men
+    print("Poisson regression in fertile men: ")
+    fertile.model <- glm(n_var ~ age + avgMotil + offset(log(depth)), data = model_df[fertility_status == "Normozoospermic"], family = poisson(link = "log"))
+    summary(fertile.model) %>% print()
+    print("Test for overdispersion in poisson model for fertile men: ")
+    AER::dispersiontest(fertile.model, alternative = "greater") %>% print()
+
+    ## Poisson regressions in subfertile men
+    print("Poisson regression in subfertile men: ")
+    subfertile.model <- glm(n_var ~ age + avgMotil + offset(log(depth)), data = model_df[fertility_status == "Oligozoospermic"], family = poisson(link = "log"))
+    summary(subfertile.model) %>% print()
+    print("Test for overdispersion in poisson model for subfertile men: ")
+    AER::dispersiontest(subfertile.model, alternative = "greater") %>% print()
+
+    ## Poisson additive model in fertile and subfertile men
+    print("Poisson additive model in fertile and subfertile men")
+    additive.model <- glm(n_var ~ age + fertility_status + avgMotil + offset(log(depth)), 
+                          data = model_df, family = poisson(link = "log"))
+    summary(additive.model) %>% print()
+    summary(additive.model)$coefficient %>% print()
+    print("Testing for overdispersion in the poisson model: ")
+    AER::dispersiontest(additive.model, alternative = "greater") %>% print()
+
+    ## Poisson interaction model in fertile and subfertile men
+    print("Poisson interaction model in fertile and subfertile men")
+    interaction.model <- glm(n_var ~ age * fertility_status + avgMotil + offset(log(depth)), 
+                             data = model_df, family = poisson(link = "log"))
+    summary(interaction.model) %>% print()
+    summary(interaction.model)$coefficient %>% print()
+    print("Testing for overdispersion in the poisson model: ")
+    AER::dispersiontest(interaction.model, alternative = "greater") %>% print() 
+
+    ## Anova comparison of additve and interaction model
+    print("Anova comparison of additve and interaction model")
+    res <- anova(additive.model, interaction.model, test = "Chisq")
+    print(res)
+    print(res$`Pr(>Chi)`[2])   
+
+    regression_datatable <- list(
+      "normo_model" = fertile.model,
+      "oligo_model" = subfertile.model, 
+      "additive_model" = additive.model,
+      "interaction_model" = interaction.model,
+      "anova" = res,
+      "family" = "Poisson"
+    )
+  }
+  if (family == "Negative Binomial") {
+    ## Negative binomial regressions in fertile men
+    print("Negative binomial regression in fertile men: ")
+    fertile.model <- glm.nb(n_var ~ age + avgMotil + offset(log(depth)), data = model_df[fertility_status == "Normozoospermic"], link = "log")
+    print(summary(fertile.model))
+
+    ## Negative binomial regressions in subfertile men
+    print("Negative binomial regression in subfertile men: ")
+    subfertile.model <- glm.nb(n_var ~ age + avgMotil + offset(log(depth)), data = model_df[fertility_status == "Oligozoospermic"], link = "log")
+    print(summary(subfertile.model))
+
+    ## Negative binomial additive model in fertile and subfertile men
+    print("Negative binomial additive model in fertile and subfertile men: ")
+    additive.model <- glm.nb(n_var ~ age + fertility_status + avgMotil + offset(log(depth)), 
+                             data = model_df, link = "log")
+    print(summary(additive.model))
+
+    ## Negative binomial interaction model in fertile and subfertile men
+    print("Negative binomial interaction model in fertile and subfertile men: ")
+    interaction.model <- glm.nb(n_var ~ age * fertility_status + avgMotil + offset(log(depth)), 
+                                data = model_df, link = "log")
+    print(summary(interaction.model))
+
+    ## Anova comparison of additve and interaction model
+    print("Anova comparison of additve and interaction model")
+    res <- anova(additive.model, interaction.model, test = "Chisq")
+    print(res)
+    print(res$`Pr(>Chi)`[2])
+
+    regression_datatable <- list(
+      "normo_model" = fertile.model,
+      "oligo_model" = subfertile.model, 
+      "additive_model" = additive.model,
+      "interaction_model" = interaction.model,
+      "anova" = res,
+      "family" = "Negative Binomial"
+    )
+  }
+  return(regression_datatable)
+}
+```
+## Poisson regressions {.tabset}
+### Overall sperm
+```{r, message=FALSE}
+poisson_model.sperm <- generate_regressions(model_df = sperm.mr_df, family = "Poisson")  
+```
+### No CtoT sperm
+```{r, message=FALSE}
+poisson_model.sperm.noCtoT <- generate_regressions(model_df = sperm.mr_df.no_CtoT, family = "Poisson")
+```
+### Matched donors sperm
+```{r, message=FALSE}
+poisson_model.sperm.matched_donors <- generate_regressions(model_df = sperm.mr_df.matched_donors, family = "Poisson")
+```
+## Negative binomial regressions {.tabset}
+### Overall sperm
+```{r, message=FALSE}
+negative_binomial_model.sperm <- generate_regressions(model_df = sperm.mr_df, family = "Negative Binomial")
+```
+### No CtoT sperm
+```{r, message=FALSE}
+negative_binomial_model.sperm.noCtoT <- generate_regressions(model_df = sperm.mr_df.no_CtoT, family = "Negative Binomial")
+```
+### Matched donors sperm
+```{r, message=FALSE}
+negative_binomial_model.sperm.matched_donors <- generate_regressions(model_df = sperm.mr_df.matched_donors, family = "Negative Binomial")
+```
+
+# Perform multiple test corrections {.tabset}
+```{r, message=FALSE}
+get_model_coefficients <- function(model, model_name) {
+  res <- summary(model)$coefficients
+  model_coefficients <- res %>% data.table()
+  model_coefficients$term <- rownames(res)
+  model_coefficients$model <- model_name
+  return(model_coefficients)
+}
+
+perform_mtc <- function(regressions_list) {
+  normo_model <- regressions_list$normo_model
+  oligo_model <- regressions_list$oligo_model
+  additive_model <- regressions_list$additive_model
+  interaction_model <- regressions_list$interaction_model
+
+  ## Get coefficients for each model
+  normo_coefficients <- get_model_coefficients(normo_model, "Normozoospermic")
+  oligo_coefficients <- get_model_coefficients(oligo_model, "Oligozoospermic")
+  additive_coefficients <- get_model_coefficients(additive_model, "Additive model")
+  interaction_coefficients <- get_model_coefficients(interaction_model, "Interaction model")
+
+  ## Combine coefficients
+  combined_coefficients <- do.call(rbind, 
+                                   list(normo_coefficients, oligo_coefficients, 
+                                        additive_coefficients, interaction_coefficients)) %>%
+    `colnames<-`(c("Estimate", "std_error", "z_value", "p_value", "term", "model")) %>%
+    filter(!(term %in% c("(Intercept)"))) %>%
+    data.table()
+
+  ## Perform MTC
+  combined_coefficients$adjusted_p_value <- p.adjust(combined_coefficients$p_value, method = "BH")    
+
+  return(combined_coefficients)
+}
+```
+## Overall Sperm (negative binomial)
+```{r, message=FALSE}
+overall_sperm_coefficients <- perform_mtc(negative_binomial_model.sperm)
+print("Overall sperm coefficients:")
+overall_sperm_coefficients %>% print()
+```
+## No CtoT Sperm (negative binomial)
+```{r, message=FALSE}
+noCtoT_sperm_coefficients <- perform_mtc(negative_binomial_model.sperm.noCtoT)
+print("No CtoT sperm coefficients:")
+noCtoT_sperm_coefficients %>% print()
+```
+## Matched Donors Sperm (negative binomial)
+```{r, message=FALSE}
+matched_donors_sperm_coefficients <- perform_mtc(negative_binomial_model.sperm.matched_donors)
+print("Matched donors sperm coefficients:")
+matched_donors_sperm_coefficients %>% print()
+```
+
+
+# Use Regression model to generate predictions {.tabset}
+Using the negative binomial additive model to generate predictions for the number of mutations in sperm for a given age, average motility, and depth.
+## Generate predictions
+```{r, message=FALSE}
+predict_regression <- function(model) {
+  prediction_depth <- 2e9
+  prediction_avgMotil <- 50
+  normo_predict_data <- data.table("age" = seq(0, 70, 1), "avgMotil" = prediction_avgMotil, "depth" = prediction_depth, "fertility_status" = "Normozoospermic")
+  oligo_predict_data <- data.table("age" = seq(0, 70, 1), "avgMotil" = prediction_avgMotil, "depth" = prediction_depth, "fertility_status" = "Oligozoospermic")
+  predict_data <- rbind(normo_predict_data, oligo_predict_data) %>% data.table()
+
+  predictions <- predict(model, newdata = predict_data, type = "response", se.fit = TRUE)
+  predict_data$predicted_n_var <- predictions$fit
+  predict_data$predicted_se <- predictions$se.fit
+
+  prediction_df_final <- predict_data %>%
+    mutate(predicted_mutationrate = predicted_n_var / depth,
+            predicted_lower.mutationrate = (predicted_n_var - (1.96 * predicted_se)) / depth,
+            predicted_upper.mutationrate = (predicted_n_var + (1.96 * predicted_se)) / depth) %>%
+    data.table()
+
+  return(prediction_df_final)
+}
+
+prediction.sperm <- predict_regression(negative_binomial_model.sperm$additive_model)
+prediction.sperm.noCtoT <- predict_regression(negative_binomial_model.sperm.noCtoT$additive_model)
+prediction.sperm.matched_donors <- predict_regression(negative_binomial_model.sperm.matched_donors$additive_model)
+```
+## Examine predictions {.tabset}
+### Average ages
+```{r, message=FALSE}
+print("Estimate mutation rate at average cohort ages:")
+avg_normo_age <- sperm.mr_df[fertility_status == "Normozoospermic"]$age %>% mean() %>% round(., 0)
+prediction.sperm[age == avg_normo_age & fertility_status == "Normozoospermic"] %>% print()
+avg_oligo_age <- sperm.mr_df[fertility_status == "Oligozoospermic"]$age %>% mean() %>% round(., 0)
+prediction.sperm[age == avg_oligo_age & fertility_status == "Oligozoospermic"] %>% print()
+```
+### At puberty
+```{r, message=FALSE}
+print("Predicted fold-increase at puberty:")
+prediction.sperm[age == 11] %>% print()
+(prediction.sperm[age == 11 & fertility_status == "Oligozoospermic"]$predicted_mutationrate / 
+   prediction.sperm[age == 11 & fertility_status == "Normozoospermic"]$predicted_mutationrate) %>% 
+  round(., digits = 3) %>% 
+  print()
+```
+### At specific normo ages
+```{r, message=FALSE}
+print("Predicted mutation frequency at age 39 in normo men")
+prediction.sperm[age == 39 & fertility_status == "Normozoospermic"] %>% print()
+
+print("Predicted mutation frequency at age 18 in normo men")
+prediction.sperm[age == 18 & fertility_status == "Normozoospermic"] %>% print()
+
+print("Predicted mutation frequency at age 30 in normo men")
+prediction.sperm[age == 30 & fertility_status == "Normozoospermic"] %>% print()
+```
+
+# Oligo vs normo age group comparison {.tabset}
+```{r, message=FALSE}
+sperm.age_comparison.df <- sperm.mr_df %>%
+  mutate(age_group = ifelse(age < 36, yes = "Young", no = ifelse(age >= 36 & age < 50, yes = "Med", no = ifelse(age >= 50, yes = "Old", no = "Fix")))) %>%
+  data.table()
+
+sperm.age_comparison.df$age_group <- factor(sperm.age_comparison.df$age_group, levels = c("Young", "Med", "Old"))
+ggplot(sperm.age_comparison.df, aes(x = age_group, y = mutation_rate, fill = fertility_status)) + 
+  geom_boxplot() + 
+  theme_bw()
+```
+## Young oligo to young normo
+```{r, message=FALSE}
+## Young to young
+print("Comparing young oligo to young normo: ")
+t.test(sperm.age_comparison.df[age_group == "Young" & fertility_status == "Normozoospermic"]$mutation_rate, 
+       sperm.age_comparison.df[age_group == "Young" & fertility_status == "Oligozoospermic"]$mutation_rate, 
+       alternative = "less") %>% print()
+```
+## Young oligo to old normo
+```{r, message=FALSE}
+## Young to old
+print("Comparing young oligo to old normo: ")
+t.test(sperm.age_comparison.df[age_group == "Old" & fertility_status == "Normozoospermic"]$mutation_rate, 
+       sperm.age_comparison.df[age_group == "Young" & fertility_status == "Oligozoospermic"]$mutation_rate, 
+       alternative = "less") %>% print()
+```
+
+# Generate plot
+## Generate mutation rate plot
+```{r, message=FALSE}
+generate_mutation_rate_plot <- function(mr_df, prediction_df, main_figure) {
+
+  normo_age_range <- mr_df[fertility_status == "Normozoospermic"]$age %>% range()
+  oligo_age_range <- mr_df[fertility_status == "Oligozoospermic"]$age %>% range()
+  
+  normo_observed_ages <- seq(floor(normo_age_range[1]), ceiling(normo_age_range[2]), 1)
+  oligo_observed_ages <- seq(floor(oligo_age_range[1]), ceiling(oligo_age_range[2]), 1)
+
+  ## Designate observed and unobserved ages
+  prediction_df <- prediction_df %>%
+    mutate(observed = ifelse((fertility_status == "Normozoospermic" & age %in% normo_observed_ages) | 
+                              (fertility_status == "Oligozoospermic" & age %in% oligo_observed_ages), 
+                             yes = "Observed", no = "Not Observed")) %>%
+    data.table()
+
+  not_observed_predictions <- prediction_df %>%
+    mutate(predicted_mutationrate = ifelse(observed == "Observed", yes = NA, no = predicted_mutationrate),
+           predicted_lower.mutationrate = ifelse(observed == "Observed", yes = NA, no = predicted_lower.mutationrate),
+           predicted_upper.mutationrate = ifelse(observed == "Observed", yes = NA, no = predicted_upper.mutationrate)) %>%                          
+    data.table()
+
+  not_observed_predictions <- not_observed_predictions[(fertility_status == "Normozoospermic" & age < max(mr_df[fertility_status == "Normozoospermic"]$age)) | 
+                                                         (fertility_status == "Oligozoospermic" & age < max(mr_df[fertility_status == "Oligozoospermic"]$age))]
+
+  ## Identify normo donors with low sperm concentrations
+  mr_df$sperm_concentration <- as.numeric(mr_df$sperm_concentration)
+  mr_df$donor_label <- ifelse(mr_df$fertility_status == "Normozoospermic" & mr_df$sperm_concentration < 15, 
+                                 yes = paste0(mr_df$donor_label, "\n", mr_df$sperm_concentration, "M/mL"), 
+                                 no = NA)
+
+  p <- ggplot() +
+    geom_point(data = mr_df, aes(x = age, y = mutation_rate, color = fertility_status)) + 
+    scale_color_manual("legend", values = c("Normozoospermic" = "#67A9CF", "Oligozoospermic" = "#EF8A62"), labels = c("Normozoospermic", "Oligozoospermic")) +
+    geom_line(data = prediction_df[observed == "Observed"], aes(x = age, y = predicted_mutationrate, color = fertility_status)) + 
+    geom_ribbon(data = prediction_df[observed == "Observed"], aes(x = age, ymin = predicted_lower.mutationrate, ymax = predicted_upper.mutationrate, fill = fertility_status), alpha = 0.1, show.legend = FALSE) + 
+    geom_line(data = not_observed_predictions, aes(x = age, y = predicted_mutationrate, color = fertility_status), linetype = "dashed") + 
+    geom_ribbon(data = not_observed_predictions, aes(x = age, ymin = predicted_lower.mutationrate, ymax = predicted_upper.mutationrate, fill = fertility_status), alpha = 0.1, show.legend = FALSE) + 
+    scale_fill_manual(values = c("Normozoospermic" = "#67A9CF", "Oligozoospermic" = "#EF8A62")) + 
+    theme_bw() +
+    xlab("Age") +
+    ylab(expression(paste("Sperm Mutation Frequency \n (# unique DNMs / bp) x", 10^-8))) +
+    labs(color = "Fertility Status") +
+    geom_errorbar(data = mr_df, aes(x = age, ymin = mutation_rate_lower, ymax = mutation_rate_upper, color = fertility_status)) +
+    guides(color = guide_legend(title = "Fertility Status"))  +
+    theme(legend.position = "top", 
+          legend.box = "horizontal", 
+          legend.key = element_blank(),
+          legend.background = element_blank(), 
+          legend.box.background = element_blank(), 
+          legend.margin = margin(c(0,0,0,0)), 
+          panel.grid.minor = element_blank(), 
+          axis.title.x = element_text(color = "black", size = 14),
+          axis.ticks.x = element_line(color = "black"),
+          axis.text.x = element_text(color = "black", size = 12), 
+          axis.title.y = element_text(color = "black", size = 14),
+          axis.ticks.y = element_line(color = "black"),
+          axis.text.y = element_text(color = "black", size = 12)) + 
+    scale_x_continuous(limits = c(10, 70), breaks = seq(10, 70, 10)) + 
+    scale_y_continuous(limits = c(0, 1.25e-7), breaks = seq(0, 1.5e-7, 2e-8), labels = seq(0, 1.5e-7, 2e-8)*10^8)
+
+  if (main_figure == TRUE) {
+    p <- p + 
+      # geom_label_repel(data = mr_df[donor_id == "D244"], aes(x = age, y = mutation_rate, label = donor_label), 
+      #                  box.padding = 0.35, segment.color = "black", 
+      #                  nudge_y = -2e-8, 
+      #                  nudge_x = -3, 
+      #                  size = 2.5) + 
+      geom_label_repel(data = mr_df[donor_id == "D130"], aes(x = age, y = mutation_rate, label = donor_label), 
+                       box.padding = 0.35, segment.color = "black", 
+                       nudge_y = 1.8e-8, 
+                       nudge_x = -8, 
+                       size = 2.5) + 
+      # geom_label_repel(data = mr_df[donor_id == "D212"], aes(x = age, y = mutation_rate, label = donor_label), 
+      #                  box.padding = 0.35, segment.color = "black", 
+      #                  nudge_y = 0.8e-8, 
+      #                  nudge_x = -8, 
+      #                  size = 2.5) + 
+      geom_label_repel(data = mr_df[donor_id == "O502"], aes(x = age, y = mutation_rate, label = donor_label), 
+                       box.padding = 0.35, segment.color = "black", 
+                       nudge_y = -2e-8, 
+                       nudge_x = 4, 
+                       size = 2.5)
+  }
+  print(p)
+
+  return(p)
+}
+
+sperm_plot <- generate_mutation_rate_plot(mr_df = sperm.mr_df, prediction_df = prediction.sperm, main_figure = TRUE)
+sperm_noCtoT_plot <- generate_mutation_rate_plot(mr_df = sperm.mr_df.no_CtoT, prediction_df = prediction.sperm.noCtoT, main_figure = FALSE)
+sperm_matched_donors_plot <- generate_mutation_rate_plot(mr_df = sperm.mr_df.matched_donors, prediction_df = prediction.sperm.matched_donors, main_figure = FALSE)
+```
+
+## Generate panel specific mutation rate plot
+### Function to compare age-adjusted panel mutation frequencies
+```{r, message=FALSE}
+panel_comparisons <- function(mr_df, num_permutations = 10000) {
+
+  library(mosaic)
+
+  # Permute comparison of panel-specific mutation frequencies
+  ## Permute: https://www.youtube.com/watch?v=nq3zC4dt6gc&ab_channel=math107
+  set.seed(2824)
+  control_df <- mr_df[panel == "Control"]
+  custom_df <- mr_df[panel == "Custom"]
+  normo_df <- mr_df[fertility_status == "Normozoospermic"]
+  oligo_df <- mr_df[fertility_status == "Oligozoospermic"]
+
+  ## Compare control panel
+  control_null <- do(num_permutations) * mean(age_adjusted_mutation_rate ~ shuffle(fertility_status), data = control_df) %>% diff()
+  observed <- mean(age_adjusted_mutation_rate ~ fertility_status, data = control_df) %>% diff()
+  head(control_null)
+  ggplot(data = control_null, aes(x = Oligozoospermic)) + geom_histogram() + geom_vline(xintercept = observed, color = "red")
+  control_p <- prop(~ Oligozoospermic >= observed, data = control_null)
+
+  ## Compare custom panel
+  custom_null <- do(num_permutations) * mean(age_adjusted_mutation_rate ~ shuffle(fertility_status), data = custom_df) %>% diff()
+  observed <- mean(age_adjusted_mutation_rate ~ fertility_status, data = custom_df) %>% diff()
+  head(custom_null)
+  ggplot(data = custom_null, aes(x = Oligozoospermic)) + geom_histogram() + geom_vline(xintercept = observed, color = "red")
+  custom_p <- prop(~ Oligozoospermic >= observed, data = custom_null)
+
+  ## Compare normo custom vs control
+  normo_null <- do(num_permutations) * mean(age_adjusted_mutation_rate ~ shuffle(panel), data = normo_df) %>% diff()
+  observed <- mean(age_adjusted_mutation_rate ~ panel, data = normo_df) %>% diff()
+  head(normo_null)
+  ggplot(data = normo_null, aes(x = Custom)) + geom_histogram() + geom_vline(xintercept = observed, color = "red")
+  normo_p <- prop(~ Custom >= observed, data = normo_null)
+
+  ## Compare oligo custom vs control
+  oligo_null <- do(num_permutations) * mean(age_adjusted_mutation_rate ~ shuffle(panel), data = oligo_df) %>% diff()
+  observed <- mean(age_adjusted_mutation_rate ~ panel, data = oligo_df) %>% diff()
+  head(oligo_null)
+  ggplot(data = oligo_null, aes(x = Custom)) + geom_histogram() + geom_vline(xintercept = observed, color = "red")
+  oligo_p <- prop(~ Custom >= observed, data = oligo_null)
+
+  print(paste("Fertile control vs custom: ", normo_p))
+  print(paste("Subfertile control vs custom: ", oligo_p))
+  print(paste("Fertile control vs subfertile control: ", control_p))
+  print(paste("Fertile custom vs subfertile custom: ", custom_p)) 
+
+  return(list("normo_p" = normo_p, 
+              "oligo_p" = oligo_p, 
+              "control_p" = control_p, 
+              "custom_p" = custom_p))
+
+}
+```
+### Create panel specific plot
+```{r, message=FALSE}
+panel.p_values <- panel_comparisons(mr_df = sperm.panel.mr_df, num_permutations = 10000)
+print(panel.p_values)
+
+normo_p <- ifelse(panel.p_values$normo_p < 0.01, yes = "***", no = "NS")
+oligo_p <- ifelse(panel.p_values$oligo_p < 0.01, yes = "***", no = "NS")
+control_p <- ifelse(panel.p_values$control_p < 0.01, yes = "***", no = "NS")
+custom_p <- ifelse(panel.p_values$custom_p < 0.01, yes = "***", no = "NS")
+
+panel_plot <- ggplot(sperm.panel.mr_df, aes(x = panel, y = age_adjusted_mutation_rate)) + 
+  geom_boxplot(aes(fill = fertility_status), linewidth=0.3, outlier.alpha = 0, position = position_dodge2()) + 
+  geom_point(aes(color = fertility_status, group = fertility_status), 
+            position = position_jitterdodge(seed=2, jitter.width = 0.1), 
+            show.legend = FALSE) + 
+  theme_bw() + 
+  scale_color_manual(values = c("Normozoospermic" = "#67A9CF", "Oligozoospermic" = "#EF8A62")) + 
+  scale_fill_manual(values = c("Normozoospermic" = "#a1cae1", "Oligozoospermic" = "#f6bea7")) + 
+  xlab("Panel") + 
+  ylab(expression(paste("Age Adjusted Mutation\nFrequency (", 10^-9, ")"))) +
+  scale_y_continuous(breaks = seq(0, 1.4e-9, .5e-9), labels =  seq(0, 1.4e-9, .5e-9)*10^9) + 
+  guides(fill = guide_legend(title = "Fertility Status")) +
+  theme(
+    legend.position = "top",
+    legend.box = "horizontal", 
+    legend.key = element_blank(),
+    legend.background = element_blank(), 
+    legend.box.background = element_blank(), 
+    legend.margin = margin(c(0,0,0,0)), 
+    panel.grid.minor = element_blank(),
+    axis.title.x = element_text(color = "black", size = 14),
+    axis.ticks.x = element_line(color = "black"),
+    axis.text.x = element_text(color = "black", size = 12),
+    axis.title.y = element_text(color = "black", size = 14),
+    axis.ticks.y = element_line(color = "black"),
+    axis.text.y = element_text(color = "black", size = 12)
+  ) + 
+  geom_signif(
+    y_position = c(1.05*10^-9, 1.25*10^-9, 1.05*10^-9, 1.15*10^-9), 
+    xmin=c(0.8, 0.8, 1.8, 1.2), 
+    xmax=c(1.2, 1.8, 2.2, 2.2), 
+    annotation = c(control_p, normo_p, custom_p, oligo_p), 
+    tip_length = 0
+  )
+```
+
+## Combine
+```{r, message=FALSE}
+fig3 <- plot_grid(sperm_plot, panel_plot, rel_widths = c(0.65, 0.35))
+print(fig3)
+ggsave(paste0(main_figure_dir, "/Figure 3.pdf"), plot = fig3, width = 8, height = 5)
+
+## Combine for supplementary
+temp <- sperm_noCtoT_plot + 
+  theme(axis.title.y = element_blank())
+
+supplementary_fig <- plot_grid(sperm_matched_donors_plot, temp, rel_widths = c(0.5, 0.5))
+print(supplementary_fig)
+ggsave(paste0(supplementary_figure_dir, "/Sperm mutation rate supplemental.pdf"), plot = supplementary_fig, width = 11, height = 5)
+
+ggsave(paste0(supplementary_figure_dir, "/Sperm No CtoT Mutation Rate.pdf"), plot = sperm_noCtoT_plot, width = 8, height = 5)
+print(sperm_noCtoT_plot)
+ggsave(paste0(supplementary_figure_dir, "/Sperm Matched Donors Mutation Rate.pdf"), plot = sperm_matched_donors_plot, width = 8, height = 5)
+print(sperm_matched_donors_plot)
+```

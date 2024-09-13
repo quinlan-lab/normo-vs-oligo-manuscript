@@ -1,0 +1,667 @@
+---
+title: "Figure 5"
+author: ""
+date: ""
+output: 
+  html_document:
+    fig_height: 3
+    fig_width: 5
+  pdf_document:
+    fig_height: 3
+    fig_width: 5
+  word_document:
+    fig_height: 3
+    fig_width: 5
+---
+
+# Setup
+```{r, setup, message=FALSE, warning=FALSE}
+## Load in datasets
+source("/scratch/ucgd/lustre-labs/quinlan/u1240855/normo-vs-oligo/R/normo-vs-oligo-data-setup.r")
+setup_list <- setup_data()
+
+sample_metadata_complete <- setup_list$sample_metadata_complete
+main_samples_metadata <- setup_list$main_samples_metadata
+donor_table <- setup_list$donor_table
+
+mutations_filtered <- setup_list$mutations_filtered
+mutations_filtered.recovered_cancer_hotspots <- setup_list$mutations_filtered.recovered_cancer_hotspots
+
+cancer_genes <- setup_list$cancer_genes
+
+sample_coverage <- setup_list$sample_coverage
+sample_coverage_interval <- setup_list$sample_coverage_interval
+
+main_figure_dir <- setup_list$main_figure_dir
+supplementary_figure_dir <- setup_list$supplementary_figure_dir
+```
+
+## Blood mutations
+```{r, message=FALSE}
+main_samples <- main_samples_metadata$sample
+
+## Blood mutations
+blood.mutations_filtered <- mutations_filtered %>%
+  filter(tissue == "Blood_DNA" & sample %in% main_samples) %>%
+  left_join(., main_samples_metadata[,c("sample", "sperm_concentration", "protocol", "avgMotil", "years_since_collection", "MedianInsertSize")], by = "sample") %>%
+  data.table()
+
+## Remove C>Ts (non-CpG>TpG)
+blood.mutations_filtered.no_CtoT <- blood.mutations_filtered %>% filter(!(subtype_collapsed %in% c("C>T"))) %>% data.table()
+
+## Only use donors with matched sperm and blood
+matched_donors <- donor_table[`Sperm Used?` == "Yes" & `Blood Used?` == "Yes"]$`Donor ID`
+blood.mutations_filtered.matched_donors <- blood.mutations_filtered[donor_label %in% matched_donors] %>% data.table()
+```
+
+## Calculate blood mutation frequencies
+```{r, message=FALSE}
+calc_mutation_frequency <- function(df, sample_coverage_df) {
+  mr_df <- df %>%
+    left_join(., sample_coverage_df[,c("sample", "total_depth")], by = c("sample")) %>%
+    group_by(donor_id, donor_label, tissue, age, timepoint, cohort, sperm_concentration,
+             fertility_status, avgMotil, years_since_collection, genomex_id) %>%
+    summarise(n_var = n_distinct(var_coord), 
+              depth = sum(unique(total_depth)), 
+              median_insert_size = median(MedianInsertSize)) %>%
+    mutate(n_var_lower = qchisq(0.025, 2*n_var)/2,
+           n_var_upper = qchisq(0.975, 2*(n_var + 1))/2) %>%
+    mutate(mutation_rate = n_var / depth,
+           mutation_rate_lower = n_var_lower / depth,
+           mutation_rate_upper = n_var_upper / depth, 
+           age_adjusted_mutation_rate = mutation_rate / age) %>%
+    data.table()
+  return(mr_df)    
+}
+
+calc_panel_mutation_frequency <- function(df, sample_coverage_interval_df) {
+  sample_panel_cov <- sample_coverage_interval %>%
+    mutate(panel = ifelse(gene == "neutral_region", yes = "Control", no = "Custom")) %>%
+    group_by(sample, panel) %>%
+    summarise(panel_cov = sum(coverage)) %>%
+    data.table()
+
+  panel_mr <- df %>%
+    mutate(panel = ifelse(panel == "custom", yes = "Custom", no = "Control")) %>%
+    left_join(., sample_panel_cov, by = c("sample", "panel")) %>%
+    group_by(donor_id, donor_label, tissue, age, timepoint, cohort, sperm_concentration,
+             fertility_status, avgMotil, years_since_collection, genomex_id, panel) %>%
+    summarise(n_var = n_distinct(var_coord), 
+              depth = sum(unique(panel_cov))) %>%
+    mutate(n_var_lower = qchisq(0.025, 2*n_var)/2,
+           n_var_upper = qchisq(0.975, 2*(n_var + 1))/2) %>%
+    mutate(mutation_rate = n_var / depth,
+           mutation_rate.lower = n_var_lower / depth,
+           mutation_rate.upper = n_var_upper / depth) %>%
+    mutate(age_adjusted_mutation_rate = mutation_rate / age, 
+           age_adjusted_mutation_rate.lower = mutation_rate.lower / age,
+           age_adjusted_mutation_rate.upper = mutation_rate.upper / age) %>%
+    mutate(motility_status = ifelse(avgMotil < 40, yes = "Low", no = "Normal")) %>%
+    group_by(donor_id, donor_label, tissue) %>%
+    mutate(num_panels_with_mutations = n_distinct(panel)) %>%
+    mutate(panel = factor(panel, levels = c("Control", "Custom"))) %>%
+    data.table()  
+
+  ## Use 0 when no mutations are found in a sample's panel
+  copy <- panel_mr[num_panels_with_mutations == 1] %>%
+    mutate(panel = "Control") %>% ## assumes mutations were found in the custom panel
+    mutate(age_adjusted_mutation_rate = 0, 
+           age_adjusted_mutation_rate.lower = 0, 
+           age_adjusted_mutation_rate.upper = 0) %>%
+    data.table()
+  panel_mr <- rbind(panel_mr, copy) %>% data.table()  
+
+  return(panel_mr)    
+}
+
+## Overall mutation frequency per sample
+sample_coverage.filtered <- sample_coverage[probe_filter_threshold == "subset_intervals.all_filters.baseline_remove_recurrence"]
+blood.mr_df <- calc_mutation_frequency(blood.mutations_filtered, sample_coverage_df = sample_coverage.filtered)
+blood.mr_df.no_CtoT <- calc_mutation_frequency(blood.mutations_filtered.no_CtoT, sample_coverage_df = sample_coverage.filtered)
+blood.mr_df.matched_donors <- calc_mutation_frequency(blood.mutations_filtered.matched_donors, sample_coverage_df = sample_coverage.filtered)
+
+## Panel specific mutation frequency per sample
+sample_coverage_interval.filtered <- sample_coverage_interval[filter == "postfilter_remove_recurrence"]
+blood.panel.mr_df <- calc_panel_mutation_frequency(blood.mutations_filtered, sample_coverage_interval_df = sample_coverage_interval)
+```
+
+# Generate regression model {.tabset}
+## Function to model data
+```{r, message=FALSE}
+generate_regressions <- function(model_df, family) {
+
+  if (family == "Poisson") {
+    ## Poisson regressions in fertile men
+    print("Poisson regression in fertile men: ")
+    fertile.model <- glm(n_var ~ age + offset(log(depth)), data = model_df[fertility_status == "Normozoospermic"], family = poisson(link = "log"))
+    summary(fertile.model) %>% print()
+    print("Test for overdispersion in poisson model for fertile men: ")
+    AER::dispersiontest(fertile.model, alternative = "greater") %>% print()
+
+    ## Poisson regressions in subfertile men
+    print("Poisson regression in subfertile men: ")
+    subfertile.model <- glm(n_var ~ age + offset(log(depth)), data = model_df[fertility_status == "Oligozoospermic"], family = poisson(link = "log"))
+    summary(subfertile.model) %>% print()
+    print("Test for overdispersion in poisson model for subfertile men: ")
+    AER::dispersiontest(subfertile.model, alternative = "greater") %>% print()
+
+    ## Poisson additive model in fertile and subfertile men
+    print("Poisson additive model in fertile and subfertile men")
+    additive.model <- glm(n_var ~ age + fertility_status + offset(log(depth)), 
+                          data = model_df, family = poisson(link = "log"))
+    summary(additive.model) %>% print()
+    summary(additive.model)$coefficient %>% print()
+    print("Testing for overdispersion in the poisson model: ")
+    AER::dispersiontest(additive.model, alternative = "greater") %>% print()
+
+    ## Poisson interaction model in fertile and subfertile men
+    print("Poisson interaction model in fertile and subfertile men")
+    interaction.model <- glm(n_var ~ age * fertility_status + offset(log(depth)), 
+                            data = model_df, family = poisson(link = "log"))
+    summary(interaction.model) %>% print()
+    summary(interaction.model)$coefficient %>% print()
+    print("Testing for overdispersion in the poisson model: ")
+    AER::dispersiontest(interaction.model, alternative = "greater") %>% print() 
+
+    ## Anova comparison of additve and interaction model
+    print("Anova comparison of additve and interaction model")
+    res <- anova(additive.model, interaction.model, test = "Chisq")
+    print(res)
+    print(res$`Pr(>Chi)`[2])   
+
+    regression_datatable <- list(
+      "normo_model" = fertile.model,
+      "oligo_model" = subfertile.model, 
+      "additive_model" = additive.model,
+      "interaction_model" = interaction.model,
+      "anova" = res,
+      "family" = "Poisson"
+    )
+  }
+  if (family == "Negative Binomial") {
+    ## Negative binomial regressions in fertile men
+    print("Negative binomial regression in fertile men: ")
+    fertile.model <- glm.nb(n_var ~ age + offset(log(depth)), data = model_df[fertility_status == "Normozoospermic"], link = "log")
+    print(summary(fertile.model))
+
+    ## Negative binomial regressions in subfertile men
+    print("Negative binomial regression in subfertile men: ")
+    subfertile.model <- glm.nb(n_var ~ age + offset(log(depth)), data = model_df[fertility_status == "Oligozoospermic"], link = "log")
+    print(summary(subfertile.model))
+
+    ## Negative binomial additive model in fertile and subfertile men
+    print("Negative binomial additive model in fertile and subfertile men: ")
+    additive.model <- glm.nb(n_var ~ age + fertility_status + offset(log(depth)), 
+                             data = model_df, link = "log")
+    print(summary(additive.model))
+
+    ## Negative binomial interaction model in fertile and subfertile men
+    print("Negative binomial interaction model in fertile and subfertile men: ")
+    interaction.model <- glm.nb(n_var ~ age * fertility_status + offset(log(depth)), 
+                                data = model_df, link = "log")
+    print(summary(interaction.model))
+
+    ## Anova comparison of additve and interaction model
+    print("Anova comparison of additve and interaction model")
+    res <- anova(additive.model, interaction.model, test = "Chisq")
+    print(res)
+    print(res$`Pr(>Chi)`[2])
+
+    regression_datatable <- list(
+      "normo_model" = fertile.model,
+      "oligo_model" = subfertile.model, 
+      "additive_model" = additive.model,
+      "interaction_model" = interaction.model,
+      "anova" = res,
+      "family" = "Negative Binomial"
+    )
+  }
+
+  return(regression_datatable)
+}
+```
+## Poisson regressions
+```{r, message=FALSE}
+poisson_model.blood <- generate_regressions(model_df = blood.mr_df, family = "Poisson")  
+```
+## Negative binomial regressions {.tabset}
+### Overall blood
+```{r, message=FALSE}
+negative_binomial_model.blood <- generate_regressions(model_df = blood.mr_df, family = "Negative Binomial")
+```
+### Blood without C>Ts
+```{r, message=FALSE}
+negative_binomial_model.blood_no_CtoT <- generate_regressions(model_df = blood.mr_df.no_CtoT, family = "Negative Binomial")
+```
+### Blood with matched donors
+```{r, message=FALSE}
+negative_binomial_model.blood_matched_donors <- generate_regressions(model_df = blood.mr_df.matched_donors, family = "Negative Binomial")
+```
+
+# Generate regressions with leave-one-out {.tabset}
+## Remove 5VW6 from the dataset
+```{r, message=FALSE}
+no_5VW6 <- generate_regressions(model_df = blood.mr_df[donor_id != "5VW6"], family = "Negative Binomial")
+no_5VW6_pvalue <- coef(summary(no_5VW6$additive_model))[3,4] %>% round(., digits = 4)
+```
+## Remove H4XT from the dataset
+```{r, message=FALSE}
+no_H4XT <- generate_regressions(model_df = blood.mr_df[donor_id != "H4XT"], family = "Negative Binomial")
+no_H4XT_pvalue <- coef(summary(no_H4XT$additive_model))[3,4] %>% round(., digits = 4)
+```
+## Remove ZM3K from the dataset
+```{r, message=FALSE}
+no_ZM3K <- generate_regressions(model_df = blood.mr_df[donor_id != "ZM3K"], family = "Negative Binomial")
+no_ZM3K_pvalue <- coef(summary(no_ZM3K$additive_model))[3,4] %>% round(., digits = 4)
+```
+
+## Remove all three
+```{r, message=FALSE}
+temp <- generate_regressions(model_df = blood.mr_df[!donor_id %in% c("5VW6", "H4XT", "ZM3K")], family = "Negative Binomial")
+summary(temp$additive_model)
+```
+
+# Perform multiple test corrections {.tabset}
+## Functions to perform MTC on regression models
+```{r, message=FALSE}
+get_model_coefficients <- function(model, model_name) {
+  res <- summary(model)$coefficients
+  model_coefficients <- res %>% data.table()
+  model_coefficients$term <- rownames(res)
+  model_coefficients$model <- model_name
+  return(model_coefficients)
+}
+
+perform_mtc <- function(regressions_list) {
+  normo_model <- regressions_list$normo_model
+  oligo_model <- regressions_list$oligo_model
+  additive_model <- regressions_list$additive_model
+  interaction_model <- regressions_list$interaction_model
+
+  ## Get coefficients for each model
+  normo_coefficients <- get_model_coefficients(normo_model, "Normozoospermic")
+  oligo_coefficients <- get_model_coefficients(oligo_model, "Oligozoospermic")
+  additive_coefficients <- get_model_coefficients(additive_model, "Additive model")
+  interaction_coefficients <- get_model_coefficients(interaction_model, "Interaction model")
+
+  ## Combine coefficients
+  combined_coefficients <- do.call(rbind, 
+                                   list(normo_coefficients, oligo_coefficients, 
+                                        additive_coefficients, interaction_coefficients)) %>%
+    `colnames<-`(c("Estimate", "std_error", "z_value", "p_value", "term", "model")) %>%
+    filter(!(term %in% c("(Intercept)"))) %>%
+    data.table()
+
+  ## Perform MTC
+  combined_coefficients$adjusted_p_value <- p.adjust(combined_coefficients$p_value, method = "BH")    
+
+  return(combined_coefficients)
+}
+```
+## Perform MTC on negative regression models
+```{r, message=FALSE}
+perform_mtc(negative_binomial_model.blood)
+```
+
+# Perform Cooks distance test to identify influential datapoints to the regression
+see: http://www.ats.ucla.edu/stat/r/dae/rreg.htm
+```{r, message=FALSE}
+
+# oligo_df <- blood.mr_df[fertility_status == "Oligozoospermic"]
+# oligo_model <- glm.nb(n_var ~ age + offset(log(depth)), data = oligo_df, link = "log")
+# oligo_cooks <- cooks.distance(oligo_model)
+
+# sample_size <- nrow(oligo_df)
+# plot(oligo_cooks, pch="*", cex=2, main="Influential Obs by Cooks distance")  # plot cook's distance
+# abline(h = 4/sample_size, col="red")  # add cutoff line
+# text(x=1:length(oligo_cooks)+1, y=oligo_cooks, labels=ifelse(oligo_cooks>4/sample_size, names(oligo_cooks),""), col="red")  # add labels
+
+# influential <- as.numeric(names(oligo_cooks)[(oligo_cooks > (4/sample_size))])
+
+# oligo_df_screen <- oligo_df[-influential, ]
+
+# ggplot(data = oligo_df, aes(x = age, y = mutation_rate)) + 
+#   geom_point() +
+#   geom_smooth(method = "lm") + 
+#   ggtitle("Before")
+
+# ggplot(data = oligo_df_screen, aes(x = age, y = mutation_rate)) + 
+#   geom_point() +
+#   geom_smooth(method = "lm") + 
+#   ggtitle("After")
+```
+
+# Use Regression model to generate predictions {.tabset}
+## Generate predictions
+Using the negative binomial additive model to generate predictions for the number of mutations in sperm for a given age, average motility, and depth.
+```{r, message=FALSE}
+predict_regression <- function(model) {
+  prediction_depth <- 2e9
+  normo_predict_data <- data.table("age" = seq(0, 70, 1), "depth" = prediction_depth, "fertility_status" = "Normozoospermic")
+  oligo_predict_data <- data.table("age" = seq(0, 70, 1), "depth" = prediction_depth, "fertility_status" = "Oligozoospermic")
+  predict_data <- rbind(normo_predict_data, oligo_predict_data) %>% data.table()
+
+  predictions <- predict(model, newdata = predict_data, type = "response", se.fit = TRUE)
+  predict_data$predicted_n_var <- predictions$fit
+  predict_data$predicted_se <- predictions$se.fit
+
+  prediction_df_final <- predict_data %>%
+    mutate(predicted_mutationrate = predicted_n_var / depth,
+            predicted_lower.mutationrate = (predicted_n_var - (1.96 * predicted_se)) / depth,
+            predicted_upper.mutationrate = (predicted_n_var + (1.96 * predicted_se)) / depth) %>%
+    data.table()
+
+  return(prediction_df_final)
+}
+
+prediction.blood <- predict_regression(negative_binomial_model.blood$additive_model)
+```
+## Examine predictions {.tabset}
+```{r, message=FALSE}
+print("Estimate mutation rate at average cohort ages:")
+avg_normo_age <- blood.mr_df[fertility_status == "Normozoospermic"]$age %>% mean() %>% round(., 0)
+prediction.blood[age == avg_normo_age & fertility_status == "Normozoospermic"] %>% print()
+avg_oligo_age <- blood.mr_df[fertility_status == "Oligozoospermic"]$age %>% mean() %>% round(., 0)
+prediction.blood[age == avg_oligo_age & fertility_status == "Oligozoospermic"] %>% print()
+```
+## At specific ages
+```{r, message=FALSE}
+print("Estimate mutation rate at 30 y/o:")
+prediction.blood[age == 30 & fertility_status == "Normozoospermic"] %>% print()
+prediction.blood[age == 30 & fertility_status == "Oligozoospermic"] %>% print()
+```
+
+## Fold difference at age 30
+```{r, message=FALSE}
+prediction.blood[age == 30] %>% print()
+(prediction.blood[age == 30 & fertility_status == "Oligozoospermic"]$predicted_mutationrate / 
+   prediction.blood[age == 30 & fertility_status == "Normozoospermic"]$predicted_mutationrate) %>% 
+  round(., digits = 3) %>% 
+  print()
+```
+
+# Generate plot
+## Generate mutation rate plot
+```{r, message=FALSE}
+generate_mutation_rate_plot <- function(mr_df, prediction_df, main_figure) {
+
+  normo_age_range <- mr_df[fertility_status == "Normozoospermic"]$age %>% range()
+  oligo_age_range <- mr_df[fertility_status == "Oligozoospermic"]$age %>% range()
+  
+  normo_observed_ages <- seq(floor(normo_age_range[1]), ceiling(normo_age_range[2]), 1)
+  oligo_observed_ages <- seq(floor(oligo_age_range[1]), ceiling(oligo_age_range[2]), 1)
+
+  ## Designate observed and unobserved ages
+  prediction_df <- prediction_df %>%
+    mutate(observed = ifelse((fertility_status == "Normozoospermic" & age %in% normo_observed_ages) | 
+                              (fertility_status == "Oligozoospermic" & age %in% oligo_observed_ages), 
+                             yes = "Observed", no = "Not Observed")) %>%
+    data.table()
+
+  not_observed_predictions <- prediction_df %>%
+    mutate(predicted_mutationrate = ifelse(observed == "Observed", yes = NA, no = predicted_mutationrate),
+           predicted_lower.mutationrate = ifelse(observed == "Observed", yes = NA, no = predicted_lower.mutationrate),
+           predicted_upper.mutationrate = ifelse(observed == "Observed", yes = NA, no = predicted_upper.mutationrate)) %>%                          
+    data.table()
+
+  not_observed_predictions <- not_observed_predictions[(fertility_status == "Normozoospermic" & age < max(mr_df[fertility_status == "Normozoospermic"]$age)) | 
+                                                         (fertility_status == "Oligozoospermic" & age < max(mr_df[fertility_status == "Oligozoospermic"]$age))]
+
+  max_y <- max(mr_df$mutation_rate_upper) * 10^8
+  p <- ggplot() +
+    geom_point(data = mr_df, aes(x = age, y = mutation_rate, color = fertility_status)) + 
+    scale_color_manual("legend", values = c("Normozoospermic" = "#67A9CF", "Oligozoospermic" = "#EF8A62"), labels = c("Normozoospermic", "Oligozoospermic")) +
+    geom_line(data = prediction_df[observed == "Observed"], aes(x = age, y = predicted_mutationrate, color = fertility_status)) + 
+    geom_ribbon(data = prediction_df[observed == "Observed"], aes(x = age, ymin = predicted_lower.mutationrate, ymax = predicted_upper.mutationrate, fill = fertility_status), alpha = 0.1, show.legend = FALSE) + 
+    geom_line(data = not_observed_predictions, aes(x = age, y = predicted_mutationrate, color = fertility_status), linetype = "dashed") + 
+    geom_ribbon(data = not_observed_predictions, aes(x = age, ymin = predicted_lower.mutationrate, ymax = predicted_upper.mutationrate, fill = fertility_status), alpha = 0.1, show.legend = FALSE) + 
+    scale_fill_manual(values = c("Normozoospermic" = "#67A9CF", "Oligozoospermic" = "#EF8A62")) + 
+    theme_bw() +
+    xlab("Age") +
+    ylab(expression(paste("Blood Mutation Frequency \n (# unique DNMs / bp) x", 10^-7))) +
+    labs(color = "Fertility Status") +
+    geom_errorbar(data = mr_df, aes(x = age, ymin = mutation_rate_lower, ymax = mutation_rate_upper, color = fertility_status)) +
+    guides(color = guide_legend(title = "Fertility Status"))  +
+    theme(legend.position = "top", 
+          legend.box = "horizontal", 
+          legend.key = element_blank(),
+          legend.background = element_blank(), 
+          legend.box.background = element_blank(), 
+          legend.margin = margin(c(0,0,0,0)), 
+          panel.grid.minor = element_blank(), 
+          axis.title.x = element_text(color = "black", size = 14),
+          axis.ticks.x = element_line(color = "black"),
+          axis.text.x = element_text(color = "black", size = 12), 
+          axis.title.y = element_text(color = "black", size = 14),
+          axis.ticks.y = element_line(color = "black"),
+          axis.text.y = element_text(color = "black", size = 12)) + 
+    scale_x_continuous(limits = c(10, 70), breaks = seq(10, 70, 10)) + 
+    scale_y_continuous(limits = c(0, 3e-7), breaks = seq(0, 3e-7, 5e-8), labels = seq(0, 3e-7, 5e-8)*10^7)
+
+  if (main_figure) {
+    p <- p + 
+      geom_label_repel(data = mr_df[donor_id == "5VW6"], aes(x = age, y = mutation_rate, label = donor_label), 
+                        box.padding = 0.35, segment.color = "black", 
+                        nudge_y = 1e-8, 
+                        nudge_x = -8, 
+                        size = 2.5) + 
+      geom_label_repel(data = mr_df[donor_id == "H4XT"], aes(x = age, y = mutation_rate, label = donor_label),   
+                        box.padding = 0.35, segment.color = "black", 
+                        nudge_y = 3e-8, 
+                        nudge_x = -7, 
+                        size = 2.5) +
+      geom_label_repel(data = mr_df[donor_id == "ZM3K"], aes(x = age, y = mutation_rate, label = donor_label), 
+                       box.padding = 0.35, segment.color = "black", 
+                       nudge_y = 4e-8, 
+                       nudge_x = 5, 
+                       size = 2.5)
+  }
+  print(p)
+
+  return(p)
+}                                                  
+
+blood_plot <- generate_mutation_rate_plot(mr_df = blood.mr_df, prediction_df = prediction.blood, main_figure = TRUE)
+```
+
+
+## Generate panel specific mutation rate plot
+### Function to compare age-adjusted panel mutation frequencies
+```{r, message=FALSE}
+panel_comparisons <- function(mr_df, num_permutations = 10000) {
+
+  library(mosaic)
+
+  # Permute comparison of panel-specific mutation frequencies
+  ## Permute: https://www.youtube.com/watch?v=nq3zC4dt6gc&ab_channel=math107
+  set.seed(2824)
+  control_df <- mr_df[panel == "Control"]
+  custom_df <- mr_df[panel == "Custom"]
+  normo_df <- mr_df[fertility_status == "Normozoospermic"]
+  oligo_df <- mr_df[fertility_status == "Oligozoospermic"]
+
+  ## Compare control panel
+  control_null <- do(num_permutations) * mean(age_adjusted_mutation_rate ~ shuffle(fertility_status), data = control_df) %>% diff()
+  observed <- mean(age_adjusted_mutation_rate ~ fertility_status, data = control_df) %>% diff()
+  head(control_null)
+  ggplot(data = control_null, aes(x = Oligozoospermic)) + geom_histogram() + geom_vline(xintercept = observed, color = "red")
+  control_p <- prop(~ Oligozoospermic >= observed, data = control_null)
+
+  ## Compare custom panel
+  custom_null <- do(num_permutations) * mean(age_adjusted_mutation_rate ~ shuffle(fertility_status), data = custom_df) %>% diff()
+  observed <- mean(age_adjusted_mutation_rate ~ fertility_status, data = custom_df) %>% diff()
+  head(custom_null)
+  ggplot(data = custom_null, aes(x = Oligozoospermic)) + geom_histogram() + geom_vline(xintercept = observed, color = "red")
+  custom_p <- prop(~ Oligozoospermic >= observed, data = custom_null)
+
+  ## Compare normo custom vs control
+  normo_null <- do(num_permutations) * mean(age_adjusted_mutation_rate ~ shuffle(panel), data = normo_df) %>% diff()
+  observed <- mean(age_adjusted_mutation_rate ~ panel, data = normo_df) %>% diff()
+  head(normo_null)
+  ggplot(data = normo_null, aes(x = Custom)) + geom_histogram() + geom_vline(xintercept = observed, color = "red")
+  normo_p <- prop(~ Custom >= observed, data = normo_null)
+
+  ## Compare oligo custom vs control
+  oligo_null <- do(num_permutations) * mean(age_adjusted_mutation_rate ~ shuffle(panel), data = oligo_df) %>% diff()
+  observed <- mean(age_adjusted_mutation_rate ~ panel, data = oligo_df) %>% diff()
+  head(oligo_null)
+  ggplot(data = oligo_null, aes(x = Custom)) + geom_histogram() + geom_vline(xintercept = observed, color = "red")
+  oligo_p <- prop(~ Custom >= observed, data = oligo_null)
+
+  print(paste("Fertile control vs custom: ", normo_p))
+  print(paste("Subfertile control vs custom: ", oligo_p))
+  print(paste("Fertile control vs subfertile control: ", control_p))
+  print(paste("Fertile custom vs subfertile custom: ", custom_p)) 
+
+  return(list("normo_p" = normo_p, 
+              "oligo_p" = oligo_p, 
+              "control_p" = control_p, 
+              "custom_p" = custom_p))
+
+}
+```
+### Compare panels without the 3 donors{.tabset}
+#### No 5VW6
+```{r, message=FALSE}
+panel.p_values <- panel_comparisons(mr_df = blood.panel.mr_df[donor_id != "5VW6"], num_permutations = 10000)
+print(panel.p_values)
+```
+#### No H4XT
+```{r, message=FALSE}
+panel.p_values <- panel_comparisons(mr_df = blood.panel.mr_df[donor_id != "H4XT"], num_permutations = 10000)
+print(panel.p_values)
+```
+#### No ZM3K
+```{r, message=FALSE}
+panel.p_values <- panel_comparisons(mr_df = blood.panel.mr_df[donor_id != "ZM3K"], num_permutations = 10000)
+print(panel.p_values)
+```
+### Create panel specific plot
+```{r, message=FALSE}
+panel.p_values <- panel_comparisons(mr_df = blood.panel.mr_df, num_permutations = 10000)
+print(panel.p_values)
+
+normo_p <- ifelse(panel.p_values$normo_p < 0.05, yes = "*", no = "NS")
+oligo_p <- ifelse(panel.p_values$oligo_p < 0.05, yes = "*", no = "NS")
+control_p <- ifelse(panel.p_values$control_p < 0.05, yes = "*", no = "NS")
+custom_p <- ifelse(panel.p_values$custom_p < 0.05, yes = "*", no = "NS")
+
+panel_plot <- ggplot(blood.panel.mr_df, aes(x = panel, y = age_adjusted_mutation_rate)) + 
+  geom_boxplot(aes(fill = fertility_status), linewidth=0.3, outlier.alpha = 0, position = position_dodge2()) + 
+  geom_point(aes(color = fertility_status, group = fertility_status), 
+             position = position_jitterdodge(seed=2, jitter.width = 0.1), 
+             show.legend = FALSE) + 
+  theme_bw() + 
+  scale_color_manual(values = c("Normozoospermic" = "#67A9CF", "Oligozoospermic" = "#EF8A62")) + 
+  scale_fill_manual(values = c("Normozoospermic" = "#a1cae1", "Oligozoospermic" = "#f6bea7")) + 
+  xlab("Panel") + 
+  ylab(expression(paste("Age Adjusted Mutation\nFrequency (", 10^-9, ")"))) +
+  scale_y_continuous(breaks = seq(0, 2.8e-9, .5e-9), labels =  seq(0, 2.8e-9, .5e-9)*10^9) + 
+  guides(fill = guide_legend(title = "Fertility Status")) +
+  theme(
+    legend.position = "top",
+    legend.box = "horizontal", 
+    legend.key = element_blank(),
+    legend.background = element_blank(), 
+    legend.box.background = element_blank(), 
+    legend.margin = margin(c(0,0,0,0)), 
+    panel.grid.minor = element_blank(),
+    axis.title.x = element_text(color = "black", size = 14),
+    axis.ticks.x = element_line(color = "black"),
+    axis.text.x = element_text(color = "black", size = 12),
+    axis.title.y = element_text(color = "black", size = 14),
+    axis.ticks.y = element_line(color = "black"),
+    axis.text.y = element_text(color = "black", size = 12)
+  ) + 
+  geom_signif(
+    y_position = c(2.3*10^-9, 2.6*10^-9, 2.3*10^-9, 2.45*10^-9), 
+    xmin=c(0.8, 0.8, 1.8, 1.2), 
+    xmax=c(1.2, 1.8, 2.2, 2.2), 
+    annotation = c(control_p, normo_p, custom_p, oligo_p), 
+    tip_length = 0
+  ) +
+  geom_label_repel(data = blood.panel.mr_df[donor_id == "5VW6"], aes(x = panel, y = age_adjusted_mutation_rate, label = donor_label), 
+                   box.padding = 0.35, segment.color = "black", 
+                   nudge_y = 0, 
+                   nudge_x = 0.5, 
+                   size = 2.5) + 
+  geom_label_repel(data = blood.panel.mr_df[donor_id == "H4XT"], aes(x = panel, y = age_adjusted_mutation_rate, label = donor_label),   
+                   box.padding = 0.35, segment.color = "black", 
+                   nudge_y = 0, 
+                   nudge_x = 0.5, 
+                   size = 2.5) +
+  geom_label_repel(data = blood.panel.mr_df[donor_id == "ZM3K"], aes(x = panel, y = age_adjusted_mutation_rate, label = donor_label), 
+                   box.padding = 0.35, segment.color = "black", 
+                   nudge_y = 0, 
+                   nudge_x = 0.5, 
+                   size = 2.5)
+print(panel_plot)  
+```
+
+## Combine
+```{r, message=FALSE}
+fig5 <- plot_grid(blood_plot, panel_plot, rel_widths = c(0.65, 0.35))
+print(fig5)
+ggsave(paste0(main_figure_dir, "/Figure 5.pdf"), plot = fig5, width = 8, height = 5)
+```
+
+# Cancer hotspot enrichment analysis 
+```{r, message=FALSE}
+main_samples <- main_samples_metadata$sample
+cancer_hotspot_df <- mutations_filtered.recovered_cancer_hotspots %>%
+  mutate(is_cancer_gene = ifelse(gene %in% cancer_genes, yes = "Cancer Gene", no = "Non-Cancer Gene")) %>%
+  filter(tissue == "Blood_DNA" & sample %in% main_samples) %>%
+  group_by(donor_id, donor_label, age, fertility_status) %>%
+  summarise(n_var = n_distinct(var_coord),
+            n_var_cancer_genes = n_distinct(var_coord[is_cancer_gene == "Cancer Gene"]),
+            n_var_noncancer_genes = n_distinct(var_coord[is_cancer_gene == "Non-Cancer Gene"]),
+            n_var_cancer_hotspot = n_distinct(var_coord[is_cancer_hotspot == "Cancer Hotspot" & is_cancer_gene == "Cancer Gene"]),
+            n_var_cancer_nonhotspot = n_distinct(var_coord[is_cancer_hotspot == "non-Cancer Hotspot" & is_cancer_gene == "Cancer Gene"]),
+            n_var_noncancer_nonhotspot = n_distinct(var_coord[is_cancer_hotspot == "non-Cancer Hotspot" & is_cancer_gene == "Non-Cancer Gene"])) %>%
+  data.table() 
+
+## Gene specific mutation fraction
+gene_fractions <- mutations_filtered.recovered_cancer_hotspots %>%
+  mutate(is_cancer_gene = ifelse(gene %in% cancer_genes, yes = "Cancer Gene", no = "Non-Cancer Gene")) %>%
+  filter(tissue == "Blood_DNA" & sample %in% main_samples & gene != "neutral_region") %>%
+  group_by(donor_id, donor_label, age, fertility_status) %>%
+  mutate(total_n_var = n_distinct(var_coord)) %>%
+  group_by(donor_id, donor_label, gene, age, fertility_status, total_n_var) %>%
+  summarise(gene_n_var = n_distinct(var_coord)) %>%
+  mutate(gene_fraction = gene_n_var / total_n_var, 
+         age_adjusted_gene_fraction = gene_fraction / age) %>%
+  data.table()
+
+final_model_coefficients <- data.table()
+genes <- unique(gene_fractions$gene)
+for (gene_name in genes) {
+  gene_df <- gene_fractions[gene == gene_name]
+  oligo_gene_df <- gene_df[fertility_status == "Oligozoospermic"]
+  normo_gene_df <- gene_df[fertility_status == "Normozoospermic"]
+
+  if (nrow(normo_gene_df) > 3 & nrow(oligo_gene_df) > 3) {
+    model <- glm(gene_fraction ~ age + fertility_status,
+                 data = gene_df, 
+                 family = binomial(link = "logit"),
+                 weights = gene_df$total_n_var)
+    res <- coef(summary(model))
+    model_coefficients <- res %>% data.table()
+    model_coefficients$term <- rownames(res)    
+    model_coefficients$gene <- gene_name
+    colnames(model_coefficients) <- c("Estimate", "std_error", "z_value", "p_value", "term", "gene")
+    final_model_coefficients <- rbind(final_model_coefficients, model_coefficients)
+  }                
+}
+
+final_model_coefficients <- final_model_coefficients %>%
+  filter(term != "(Intercept)") %>%
+  data.table()
+final_model_coefficients$adjusted_p_value <- p.adjust(final_model_coefficients$p_value, method = "BH")
+final_model_coefficients[p_value < 0.05]    
+
+ggplot(gene_fractions[gene == "PTPN11"], aes(x = age, y = gene_fraction, color = fertility_status)) + 
+  geom_point() + 
+  geom_smooth(method = "lm") + 
+  facet_wrap(~gene) + 
+  ggtitle("Gene specific mutation fraction")
+```

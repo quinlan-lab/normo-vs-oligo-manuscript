@@ -1,0 +1,574 @@
+---
+title: "Figure 4"
+author: ""
+date: ""
+output: 
+  html_document:
+    fig_height: 3
+    fig_width: 5
+  pdf_document:
+    fig_height: 3
+    fig_width: 5
+  word_document:
+    fig_height: 3
+    fig_width: 5
+---
+
+# Setup
+```{r, setup, message=FALSE, warning=FALSE}
+## Load in datasets
+source("/scratch/ucgd/lustre-labs/quinlan/u1240855/normo-vs-oligo/R/normo-vs-oligo-data-setup.r")
+setup_list <- setup_data()
+
+sample_metadata_complete <- setup_list$sample_metadata_complete
+main_samples_metadata <- setup_list$main_samples_metadata
+semen_parameters <- setup_list$semen_parameters
+
+pae_mutations <- setup_list$mutations_filtered.recovered_PAE
+pae_genes <- setup_list$pae_genes
+patho_values <- setup_list$patho_values
+
+main_figure_dir <- setup_list$main_figure_dir
+supplementary_figure_dir <- setup_list$supplementary_figure_dir
+```
+
+# Pae mutations in sperm
+```{r, message=FALSE}
+main_samples <- main_samples_metadata$sample
+
+## Sperm mutations
+pae_df <- pae_mutations %>%
+  filter(tissue == "Sperm_DNA" & sample %in% main_samples) %>%
+  left_join(., main_samples_metadata[,c("sample",  "MedianInsertSize", "years_since_collection", "protocol",
+                                        semen_parameters), with=FALSE], by = "sample") %>%
+  data.table()
+```
+
+# Summary statistics for GoF, Pathogenic, and GoF+P fractions
+```{r, message=FALSE}
+summary_stats <- pae_df %>%
+  filter(is_pae_gene == "PAE") %>%
+  summarise(n_var = n_distinct(var_coord),
+            n_var_pae = n_distinct(var_coord[is_pae_var == TRUE]),
+            n_var_patho = n_distinct(var_coord[is_patho == "Pathogenic"]),
+            n_var_nonpae_patho = n_distinct(var_coord[is_pae_var == FALSE & is_patho == "Pathogenic"]),
+            n_var_pae_patho = n_distinct(var_coord[is_pae_var == TRUE & is_patho == "Pathogenic"]),
+            n_var_pae_nonpatho = n_distinct(var_coord[is_pae_var == TRUE & is_patho == "non-Pathogenic"]))
+
+print("Summary stats for pathogenic burdens: ")
+print(summary_stats)
+```
+
+# Get pae var fractions
+```{r, message=FALSE}
+## Get fraction that are GoF and Pathogenic in PAE
+patho_pae_df <- pae_df %>% 
+  group_by(donor_id, age, fertility_status, avgMotil) %>%
+  summarise(n_var = n_distinct(var_coord),
+            n_var_patho = n_distinct(var_coord[is_patho == "Pathogenic"]),
+            n_var_nonpatho = n_distinct(var_coord[is_patho == "non-Pathogenic"]),
+            n_var_patho_pae = n_distinct(var_coord[is_patho == "Pathogenic" & is_pae_gene == "PAE"]),
+            n_var_patho_nonpae = n_distinct(var_coord[is_patho == "Pathogenic" & is_pae_gene == "non-PAE"]),
+            n_var_nonpatho_pae = n_distinct(var_coord[is_patho == "non-Pathogenic" & is_pae_gene == "PAE"]),
+            n_var_nonpatho_nonpae = n_distinct(var_coord[is_patho == "non-Pathogenic" & is_pae_gene == "non-PAE"])) %>%
+  mutate(patho_fraction = n_var_patho / n_var,
+         nonpatho_fraction = n_var_nonpatho / n_var,
+         patho_pae_fraction = n_var_patho_pae / n_var,
+         patho_nonpae_fraction = n_var_patho_nonpae / n_var,
+         nonpatho_pae_fraction = n_var_nonpatho_pae / n_var,
+         nonpatho_nonpae_fraction = n_var_nonpatho_nonpae / n_var) %>%
+  reshape2::melt(id.vars = c("donor_id", "age", "fertility_status", "avgMotil", "n_var"),
+                 variable.name = "Group") %>%
+  data.table()
+```
+
+# Specify functions{.tabset}
+## Generate regression models
+```{r, message=FALSE}
+generate_regressions <- function(model_df, patho_status, pae_status) {
+  ## Normozoospermic model
+  normo_model_df <- model_df[fertility_status == "Normozoospermic"]
+  normo_model <- glm(value ~ age + avgMotil, 
+                     data = normo_model_df,
+                     family = binomial(link = "logit"),
+                     weights = normo_model_df$n_var)
+  normo_summary <- summary(normo_model)
+
+  ## Oligozoospermic model
+  oligo_model_df <- model_df[fertility_status == "Oligozoospermic"]
+  oligo_model <- glm(value ~ age + avgMotil, 
+                     data = oligo_model_df,
+                     family = binomial(link = "logit"),
+                     weights = oligo_model_df$n_var)
+  oligo_summary <- summary(oligo_model)
+
+  ## Additive model
+  additive_model <- glm(value ~ age + fertility_status + avgMotil, 
+                        data = model_df,
+                        family = binomial(link = "logit"),
+                        weights = model_df$n_var)
+  additive_summary <- summary(additive_model)
+
+  ## Interaction model
+  interaction_model <- glm(value ~ age * fertility_status + avgMotil, 
+                           data = model_df,
+                           family = binomial(link = "logit"),
+                           weights = model_df$n_var)
+  interaction_summary <- summary(interaction_model)
+
+  ## anova
+  anova_test <- anova(additive_model, interaction_model, test = "Chisq")
+
+  return(list("normo_model" = normo_model, "normo_summary" = normo_summary,
+              "oligo_model" = oligo_model, "oligo_summary" = oligo_summary,
+              "additive_model" = additive_model, "additive_summary" = additive_summary,
+              "interaction_model" = interaction_model, "interaction_summary" = interaction_summary,
+              "anova_test" = anova_test,
+              "patho_status" = patho_status, 
+              "pae_status" = pae_status))                    
+}
+```
+## Predict regression models
+```{r, message=FALSE}
+predict_regression_models <- function(model_df, model) {
+
+  groups <- model_df$Group %>% unique()   
+  fertility_status <- model_df$fertility_status %>% unique()
+
+  ## Generate prediction_df 
+  prediction_avgMotil <- 50
+  normo_predict_data <- data.table("age" = seq(0, 70, 1), "avgMotil" = prediction_avgMotil)
+  oligo_predict_data <- data.table("age" = seq(0, 70, 1), "avgMotil" = prediction_avgMotil)
+  prediction_data <- rbind(normo_predict_data, oligo_predict_data) %>% data.table()
+
+  prediction_data_final <- data.table()
+  for (group in groups) {
+    for (status in fertility_status) {
+      prediction_data$Group <- group
+      prediction_data$fertility_status <- status
+      prediction_data_final <- rbind(prediction_data_final, prediction_data)
+    }
+  }
+
+  predictions_df <- predict(model, newdata = prediction_data_final, type = "response", se.fit = TRUE)
+  prediction_data_final$predicted_value <- predictions_df$fit
+  prediction_data_final$predicted_se <- predictions_df$se.fit
+
+  ## Get observed age ranges
+  normo_age_range <- model_df[fertility_status == "Normozoospermic"]$age %>% range()
+  oligo_age_range <- model_df[fertility_status == "Oligozoospermic"]$age %>% range()
+  
+  normo_observed_ages <- seq(floor(normo_age_range[1]), ceiling(normo_age_range[2]), 1)
+  oligo_observed_ages <- seq(floor(oligo_age_range[1]), ceiling(oligo_age_range[2]), 1)
+
+  ## Designate observed and unobserved ages
+  prediction_data_final <- prediction_data_final %>%
+    mutate(observed = ifelse((fertility_status == "Normozoospermic" & age %in% normo_observed_ages) | 
+                               (fertility_status == "Oligozoospermic" & age %in% oligo_observed_ages), 
+                             yes = "Observed", no = "Not Observed")) %>%
+    data.table()
+
+  return(prediction_data_final)
+}
+```
+## Generate fraction plots
+```{r, message=FALSE}
+## Generate plot from regression models
+generate_regression_plots <- function(model_df, prediction_df, patho_status, gene_status) {
+
+  ## Determine what the comparison is
+  groups <- unique(model_df$Group)
+  fertility_status <- unique(model_df$fertility_status)
+
+  ## Compare fertility status
+  if ((length(fertility_status) > 1) & (length(groups) == 1)) {
+    ylab <- paste0("Fraction of all DNMs that are \n ", patho_status, " in ", gene_status, " Genes")
+    p <- ggplot(model_df) + 
+      geom_point(aes(x = age, y = value, color = fertility_status)) +
+      geom_line(data = prediction_df[observed == "Observed"], 
+                aes(x = age, y = predicted_value, color = fertility_status)) +
+      geom_ribbon(data = prediction_df[observed == "Observed"], 
+                  aes(x = age, ymin = predicted_value - 1.96 * predicted_se, 
+                      ymax = predicted_value + 1.96 * predicted_se, fill = fertility_status), 
+                  alpha = 0.1, show.legend = FALSE) +  
+      guides(color = guide_legend(title = "Fertility Status"))  +
+      scale_color_manual(values = c("Normozoospermic" = "#67A9CF", "Oligozoospermic" = "#EF8A62")) +
+      scale_fill_manual(values = c("Normozoospermic" = "#67A9CF", "Oligozoospermic" = "#EF8A62")) +
+      theme_bw() +   
+      scale_y_continuous(limits = c(0, 0.2), breaks = seq(0, 0.2, 0.05)) +
+      theme(
+        legend.position = "top",
+        legend.title = element_text(color = "black", size = 14),
+        legend.text = element_text(color = "black", size = 12),
+        strip.background = element_blank(),
+        strip.text = element_text(size = 12, color = "black"),
+        strip.placement = "outside",
+        panel.grid.minor = element_blank(),
+        axis.title.x = element_text(color = "black", size = 14),
+        axis.text.x = element_text(color = "black", size = 12),
+        axis.text.y = element_text(color = "black", size = 12),
+      ) +
+      labs(x = "Age (years)", y = ylab) + 
+      scale_x_continuous(limits = c(20, 70), breaks = seq(20, 70, 10))   
+  } else {
+    print("Check model_df, it is not proper...")
+  }
+  return(p)
+}
+```
+### Generate heatmap plot
+```{r, message=FALSE}
+generate_patho_heatmap_plot <- function(final_df, patho_values, pae_genes) {
+  
+  ## Subset mutation dataset
+  df <- final_df %>%
+    group_by(donor_id, donor_label, fertility_status, gene) %>%
+    mutate(clin_label = ifelse(clin_sig %in% patho_values, yes = "*", no = "NP"), 
+           gene_n_var = n_distinct(var_coord), 
+           gene_n_var_patho = n_distinct(var_coord[clin_label == "*"])) %>%
+    select(donor_label, donor_id, age, age_group, fertility_status, gene, gene_n_var, gene_n_var_patho) %>%
+    `colnames<-`(c("sample", "donor_id", "age", "age_group", "fertility_status", "gene", "gene_n_var", "gene_n_var_patho")) %>%
+    mutate(has_patho = ifelse(gene_n_var_patho > 0, yes = "Yes", no = "No")) %>%
+    data.table()
+
+
+  all_samples <- df$sample %>% unique()
+  normo_samples <- df[fertility_status == "Normozoospermic"]$sample %>% unique()
+  oligo_samples <- df[fertility_status == "Oligozoospermic"]$sample %>% unique()    
+
+  ## Assign heatmap sample order
+  gene_num <- 15
+  ## Get the gene order
+  gene_count_df <- df %>%
+    filter(gene_n_var_patho > 0) %>%
+    group_by(gene) %>%
+    arrange(-age) %>%
+    mutate(samples = paste0(sample, collapse = ";"),
+           n_samples = n_distinct(sample)) %>%
+    select(gene, samples, n_samples) %>%
+    arrange(-n_samples) %>%
+    unique() %>%
+    data.table()
+  gene_order <- gene_count_df$gene
+  gene_order <- gene_order[1:gene_num]
+  heatmap_df <- df[gene %in% gene_order]
+
+  ## Add samples with no data
+  samples_no_data <- all_samples[!(all_samples %in% unique(df$sample))]
+  if (length(samples_no_data) > 0) {
+    samples_no_data_temp <- data.frame(sample = samples_no_data,
+                                      age = rep("none", length(samples_no_data)),
+                                      gene = rep(gene_order[1], length(samples_no_data)),
+                                      gene_n_var = rep("none", length(samples_no_data)),
+                                      mutation = rep("none"),
+                                      clin_label = rep("", length(samples_no_data)),
+                                      is_pae = rep("none"))
+
+    heatmap_df <- rbind(heatmap_df, samples_no_data_temp) %>%
+      data.table()
+  }
+
+  ## Get the sample order based on gene prevalence
+  sample_order_df <- data.table("sample" = all_samples,
+                                "gene1" = rep(0, length(all_samples)),
+                                "gene2" = rep(0, length(all_samples)),
+                                "gene3" = rep(0, length(all_samples)),
+                                "gene4" = rep(0, length(all_samples)),
+                                "gene5" = rep(0, length(all_samples)),
+                                "gene6" = rep(0, length(all_samples)),
+                                "gene7" = rep(0, length(all_samples)),
+                                "gene8" = rep(0, length(all_samples)),
+                                "gene9" = rep(0, length(all_samples)),
+                                "gene10" = rep(0, length(all_samples))
+                                )
+
+  j=2
+  for (i in seq(1, ncol(sample_order_df) - 1, 1)) {
+    samples <- strsplit(gene_count_df[gene == gene_order[i]]$samples, split = ";")[[1]]
+
+    sample_order_df[sample_order_df[[1]] %in% samples, (j) := 1]
+    j <- j + 1
+
+  }
+  sample_order_df_final <- sample_order_df %>%
+    arrange(-gene1, -gene2, -gene3, -gene4, -gene5, -gene6, -gene7, -gene8) %>%
+    select(sample)
+  sample_order <- sample_order_df_final$sample
+
+  ## Generate heatmap
+  heatmap_df$sample <- factor(heatmap_df$sample, levels = sample_order)
+  heatmap_df$gene <- factor(heatmap_df$gene, levels = rev(gene_order))
+
+  ## Calculate fraction of donors with patho DNM in each gene
+  gene_name_df <- df %>%
+    filter(has_patho == "Yes") %>%
+    group_by(fertility_status, gene) %>%
+    summarise(n_donors = n_distinct(sample)) %>%
+    mutate(total_donors_in_cohort = ifelse(fertility_status == "Normozoospermic",
+                                yes = length(normo_samples),
+                                no = length(oligo_samples)),
+          fraction = n_donors / total_donors_in_cohort) %>%
+    select(gene, fertility_status, fraction) %>%
+    dcast(gene ~ fertility_status, value.var = "fraction") %>%
+    mutate(Normozoospermic_per = ifelse(is.na(Normozoospermic), 0, round(Normozoospermic, 2)*100),
+          Oligozoospermic_per = ifelse(is.na(Oligozoospermic), 0, round(Oligozoospermic, 2)*100),
+          gene_fraction = paste0(gene, " (", Normozoospermic_per, "%, ", Oligozoospermic_per, "%)")) %>%
+    filter(gene %in% gene_order)
+
+  gene_name_df$gene <- factor(gene_name_df$gene, levels = gene_order)
+  gene_fraction_order_df <- with(gene_name_df, gene_name_df[order(gene),])
+  gene_fraction_order <- rev(gene_fraction_order_df$gene_fraction)
+
+  ## Generate heatmap
+  temp <- heatmap_df[,c("sample", "gene", "gene_n_var_patho", "has_patho")] %>%
+    left_join(., gene_name_df[,c("gene", "gene_fraction")])
+  temp$gene_fraction <- factor(temp$gene_fraction, levels = gene_fraction_order)
+  heatmap_plot <- ggplot() +
+    geom_tile(data = temp, aes(x = sample, y = gene_fraction, fill = has_patho)) +
+    scale_fill_manual(values = c("Yes" = "lightgrey", "No" = "white")) +
+    guides(fill=guide_legend(title="Pathogenic DNM\nDetected?")) +
+    theme_bw() +
+    theme(axis.title.x = element_blank(),
+          axis.text.x = element_blank(),
+          axis.title.y = element_blank(),
+          axis.text.y = element_text(color = "black", size = 12),
+          axis.ticks.y = element_blank(),
+          plot.margin = unit(c(0, 0, 0, 0), "cm"),
+          panel.spacing = unit(c(-1, -1, -1, -1), "cm"),
+          legend.position = "none",
+          panel.grid.major = element_blank())
+
+  ## Store data
+  donor_metadata <- final_df %>%
+    group_by(donor_id, donor_label, age, age_group, fertility_status) %>%
+    summarise(n_var = n_distinct(var_coord),
+              n_var_patho_pae = n_distinct(var_coord[is_patho == "Pathogenic" & is_pae_gene == "PAE"]),
+              n_var_patho_nonpae = n_distinct(var_coord[is_patho == "Pathogenic" & is_pae_gene == "non-PAE"])) %>%
+    ungroup() %>%              
+    select(-c("age", "donor_id")) %>%
+    melt(., id.vars = c("donor_label", "fertility_status"), variable.name = "Category") %>%
+    data.table()
+
+  donor_metadata$donor_label <- factor(donor_metadata$donor_label, levels = sample_order)
+  donor_metadata <- donor_metadata[!is.na(donor_label)]
+  donor_metadata$Category <- factor(donor_metadata$Category,
+                                    levels = c("n_var_patho_nonpae", "n_var_patho_pae",
+                                               "n_var", "age_group"))
+  # donor_metadata$value <- as.character(round(donor_metadata$value, 0))
+  donor_metadata$donor_color <- ifelse(donor_metadata$fertility_status == "Normozoospermic", "#67A9CF", "#EF8A62")
+
+  col <- c("Normozoospermic" = "#67A9CF", "Oligozoospermic" = "#EF8A62")
+
+  clinical_plot <- ggplot(donor_metadata, aes(x = donor_label, y = Category, label = value)) +
+    geom_text(size = 3) +
+    theme_bw() +
+    theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          legend.position = "none",
+          axis.title.x = element_blank(),
+          axis.title.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          axis.text.x = element_text(angle = 90,
+                                     vjust=1,
+                                     hjust=-.05,
+                                     face = "bold",
+                                     color = as.character(donor_metadata$donor_color[order(unique(donor_metadata$donor_label))])),
+          axis.text.y = element_text(color = "black")) +
+    scale_x_discrete(position = "top",
+                     labels = sample_order) +
+    scale_y_discrete(labels = c("age" = "Age",
+                                "n_var" = "Total DNM",
+                                "n_var_patho_nonpae" = "Patho DNM (non-PAE)",
+                                "n_var_patho_pae" = "Patho DNM (PAE)"))
+
+  ## COMBINE PLOTS
+  combined_plot <- plot_grid(heatmap_plot,
+                    clinical_plot,
+                    nrow = 2, ncol = 1,
+                    rel_heights = c(3, 1),
+                    align = "v")
+
+  return(combined_plot)
+
+}
+```
+
+# Plots - fraction patho and non-patho in PAE
+## Pathogneic PAE ~ Age in normo and oligo men {.tabset}
+```{r, message=FALSE}
+model_df <- patho_pae_df[Group == "patho_pae_fraction"]
+patho_pae_regressions <- generate_regressions(model_df, patho_status = "Pathogenic", pae_status = "PAE")
+```
+### Normozoospermic
+```{r, message=FALSE}
+print(patho_pae_regressions$normo_summary)
+```
+### Oligozoospermic
+```{r, message=FALSE}
+print(patho_pae_regressions$oligo_summary)
+```
+### Overall additive model
+```{r, message=FALSE}
+print(patho_pae_regressions$additive_summary)                  
+```
+### Overall interaction model
+```{r, message=FALSE}
+print(patho_pae_regressions$interaction_summary)
+```
+### ANOVA test 
+```{r, message=FALSE}
+print(patho_pae_regressions$anova_test)
+```
+### Predict patho pae regressions
+```{r, message=FALSE}
+additive_model <- patho_pae_regressions$additive_model
+patho_pae_prediction_df <- predict_regression_models(model_df, additive_model)
+```
+### Generate plots
+```{r, message=FALSE}
+patho_pae_plot <- generate_regression_plots(model_df = model_df, prediction_df = patho_pae_prediction_df, 
+                                            patho_status = "Pathogenic", gene_status = "PAE")
+```
+
+## Non-pathogneic PAE ~ Age in normo and oligo men {.tabset}
+```{r, message=FALSE}
+model_df <- patho_pae_df[Group == "nonpatho_pae_fraction"]
+nonpatho_pae_regressions <- generate_regressions(model_df, patho_status = "non-Pathogenic", pae_status = "PAE")
+```
+### Normozoospermic
+```{r, message=FALSE}
+print(nonpatho_pae_regressions$normo_summary)
+```
+### Oligozoospermic
+```{r, message=FALSE}
+print(nonpatho_pae_regressions$oligo_summary)
+```
+### Overall additive model
+```{r, message=FALSE}
+print(nonpatho_pae_regressions$additive_summary)
+```
+### Overall interaction model
+```{r, message=FALSE}
+print(nonpatho_pae_regressions$interaction_summary)
+```
+### ANOVA test
+```{r, message=FALSE}
+print(nonpatho_pae_regressions$anova_test)
+```
+### Predict nonpatho pae regressions
+```{r, message=FALSE}
+additive_model <- nonpatho_pae_regressions$additive_model
+nonpatho_pae_prediction_df <- predict_regression_models(model_df, additive_model)
+```
+### Generate plots
+```{r, message=FALSE}
+nonpatho_pae_plot <- generate_regression_plots(model_df = model_df, prediction_df = nonpatho_pae_prediction_df, 
+                                               patho_status = "non-Pathogenic", gene_status = "PAE")
+```
+
+## Pathogenic in non-PAE genes {.tabset}
+```{r, message=FALSE}
+model_df <- patho_pae_df[Group == "patho_nonpae_fraction"]
+patho_nonpae_regressions <- generate_regressions(model_df, patho_status = "Pathogenic", pae_status = "non-PAE")
+```
+### Normozoospermic
+```{r, message=FALSE}
+print(patho_nonpae_regressions$normo_summary)
+```
+### Oligozoospermic
+```{r, message=FALSE}
+print(patho_nonpae_regressions$oligo_summary)
+```
+### Overall additive model
+```{r, message=FALSE}
+print(patho_nonpae_regressions$additive_summary)
+```
+### Overall interaction model
+```{r, message=FALSE}
+print(patho_nonpae_regressions$interaction_summary)
+```
+### ANOVA test
+```{r, message=FALSE}
+print(patho_nonpae_regressions$anova_test)
+```
+### Predict patho nonpae regressions
+```{r, message=FALSE}
+additive_model <- patho_nonpae_regressions$additive_model
+patho_nonpae_prediction_df <- predict_regression_models(model_df, additive_model)
+```
+### Generate plots
+```{r, message=FALSE}
+patho_nonpae_plot <- generate_regression_plots(model_df = model_df, prediction_df = patho_nonpae_prediction_df, 
+                                               patho_status = "Pathogenic", gene_status = "non-PAE")
+ggsave(paste0(supplementary_figure_dir, "/Pathogenic in non-PAE genes.pdf"), patho_nonpae_plot, width = 6, height = 4)                                               
+```
+
+# Pathogenic PAE heatmap
+```{r, message=FALSE}
+heatmap_plot <- generate_patho_heatmap_plot(pae_df, patho_values, pae_genes)
+```
+
+# Create figure 4
+```{r, message=FALSE}
+fraction_plots <- plot_grid(patho_pae_plot, nonpatho_pae_plot, ncol = 2, rel_widths = c(1, 1))
+fig4 <- plot_grid(fraction_plots, heatmap_plot, nrow = 2, rel_heights = c(1.25, 2.25))
+print(fig4)
+ggsave(paste0(main_figure_dir, "/Figure 4.pdf"), fig4, width = 8.5, height = 9.25, dpi = 300)
+```
+
+# Perform multiple test corrections {.tabset}
+## Functions to perform MTC on regression models
+```{r, message=FALSE}
+get_model_coefficients <- function(model, model_name, patho_status, pae_status) {
+  res <- summary(model)$coefficients
+  model_coefficients <- res %>% data.table()
+  model_coefficients$term <- rownames(res)
+  model_coefficients$model <- model_name
+  model_coefficients$patho_status <- patho_status
+  model_coefficients$pae_status <- pae_status
+  return(model_coefficients)
+}
+
+perform_mtc <- function(regressions_list) {
+  normo_model <- regressions_list$normo_model
+  oligo_model <- regressions_list$oligo_model
+  additive_model <- regressions_list$additive_model
+  interaction_model <- regressions_list$interaction_model
+  patho_status <- regressions_list$patho_status
+  pae_status <- regressions_list$pae_status
+
+  ## Get coefficients for each model
+  normo_coefficients <- get_model_coefficients(normo_model, "Normozoospermic", patho_status, pae_status)
+  oligo_coefficients <- get_model_coefficients(oligo_model, "Oligozoospermic", patho_status, pae_status)
+  additive_coefficients <- get_model_coefficients(additive_model, "Additive model", patho_status, pae_status)
+  interaction_coefficients <- get_model_coefficients(interaction_model, "Interaction model", patho_status, pae_status)
+
+  ## Combine coefficients
+  combined_coefficients <- do.call(rbind, 
+                                   list(normo_coefficients, oligo_coefficients, 
+                                        additive_coefficients, interaction_coefficients)) %>%
+    `colnames<-`(c("Estimate", "std_error", "z_value", "p_value", "term", "model", "patho_status", "pae_status")) %>%
+    filter(!(term %in% c("(Intercept)"))) %>%
+    data.table()
+
+  ## Perform MTC
+  combined_coefficients$adjusted_p_value <- p.adjust(combined_coefficients$p_value, method = "BH")    
+
+  return(combined_coefficients)
+}
+```
+## Pathogenic PAE
+```{r, message=FALSE}
+patho_pae_mtc <- perform_mtc(patho_pae_regressions)
+print(patho_pae_mtc)
+```
+## Non-pathogenic PAE
+```{r, message=FALSE}
+nonpatho_pae_mtc <- perform_mtc(nonpatho_pae_regressions)
+print(nonpatho_pae_mtc)
+```
+## Pathogenic non-PAE
+```{r, message=FALSE}
+patho_nonpae_mtc <- perform_mtc(patho_nonpae_regressions)
+print(patho_nonpae_mtc)
+```

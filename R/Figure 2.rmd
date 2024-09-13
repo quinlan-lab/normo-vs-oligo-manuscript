@@ -1,0 +1,267 @@
+---
+title: "Figure 2"
+author: ""
+date: ""
+output: 
+  html_document:
+    fig_height: 3
+    fig_width: 5
+  pdf_document:
+    fig_height: 3
+    fig_width: 5
+  word_document:
+    fig_height: 3
+    fig_width: 5
+---
+
+```{r, setup, message=FALSE, warning=FALSE}
+## Load in datasets
+source("/scratch/ucgd/lustre-labs/quinlan/u1240855/normo-vs-oligo/R/normo-vs-oligo-data-setup.r")
+setup_list <- setup_data()
+
+mutations_filtered <- setup_list$mutations_filtered
+sample_metadata_complete <- setup_list$sample_metadata_complete
+sample_coverage <- setup_list$sample_coverage
+main_figure_dir <- setup_list$main_figure_dir
+```
+
+# Figure 2: Longitduinal Mutation Frequency
+## Calculate mutation frequencies
+```{r, message=FALSE}
+longitudinal_sperm_mutations_filtered <- mutations_filtered %>%
+  left_join(., sample_metadata_complete[,c("sample", "include")], by = "sample") %>%
+  filter(include == TRUE) %>%
+  filter(tissue == "Sperm_DNA" & fertility_status == "Normozoospermic" & cohort == "Longitudinal") %>%
+  group_by(donor_id, donor_label) %>%
+  mutate(n_timepoints = n_distinct(timepoint),) %>%
+  filter(n_timepoints > 1) %>%
+  mutate(num_replicates = n_distinct(input_dna)) %>%
+  data.table()
+
+## Get mutation rate by input DNA (200ng vs 500ng)
+mutation_frequency_by_input_dna <- longitudinal_sperm_mutations_filtered %>%  
+  filter(num_replicates == 2) %>%
+  left_join(., sample_coverage[probe_filter_threshold == "subset_intervals.all_filters.baseline_remove_recurrence", 
+                               c("sample", "total_depth")], by = "sample") %>%
+  group_by(donor_id, donor_label, age, input_dna, timepoint) %>%
+  summarise(n_var = n_distinct(var_coord), 
+            depth = unique(total_depth)) %>%
+  mutate(n_var_lower = qchisq(0.025, 2*n_var)/2, 
+         n_var_upper = qchisq(0.975, 2*n_var)/2,
+         mutation_rate = n_var/depth,
+         mutation_rate_lower = n_var_lower/depth,
+         mutation_rate_upper = n_var_upper/depth) %>% 
+  data.table()
+
+## Get overall mutation rate
+mutation_frequency_overall <- longitudinal_sperm_mutations_filtered %>%
+  left_join(., sample_coverage[probe_filter_threshold == "subset_intervals.all_filters.baseline_remove_recurrence", 
+                               c("sample", "total_depth")], by = "sample") %>%
+  group_by(donor_id, donor_label, age, timepoint) %>%
+  summarise(n_var = n_distinct(var_coord), 
+            depth = sum(unique(total_depth))) %>%
+  mutate(n_var_lower = qchisq(0.025, 2*n_var)/2,
+         n_var_upper = qchisq(0.975, 2*n_var)/2,
+         mutation_rate = n_var/depth,
+         mutation_rate_lower = n_var_lower/depth,
+         mutation_rate_upper = n_var_upper/depth,
+         input_dna = "Overall") %>%
+  data.table()          
+```
+
+## Calculate  DNAM accumualtion rates
+```{r, message=FALSE}
+## Calculate DNM accumulation rates
+dnm_accumulation <- mutation_frequency_overall %>% 
+  dplyr::select(donor_id, donor_label, age, mutation_rate) %>%
+  arrange(donor_id, donor_label, -age) %>% 
+  group_by(donor_id, donor_label) %>% 
+  summarise(age_diff = age[1] - age[2],
+            diff = (mutation_rate[1] - mutation_rate[2]) / (age[1] - age[2])) %>% 
+  mutate(dnm_accumulation = diff * 3.2e9) %>%
+  arrange(-dnm_accumulation) %>%
+  mutate(text_label = paste0(donor_label, ": ", round(dnm_accumulation, 1), " DNMs/year")) %>%
+  data.table()
+print(dnm_accumulation)
+print(paste0("Average DNM accumulation rate: ", round(mean(dnm_accumulation$dnm_accumulation), 2), " DNMs/year"))
+
+## Get donor order based on DNM accumulation rates
+donor_order <- dnm_accumulation[order(-dnm_accumulation),]$text_label %>% unique()
+```
+
+## Combine longitudinal mutation frequency datasets
+```{r, message=FALSE}
+## Combine datasets
+final_df <- rbind(
+  mutation_frequency_overall[,c("donor_id", "donor_label", "age", "n_var", "depth", "mutation_rate", "mutation_rate_lower", "mutation_rate_upper", "input_dna")],
+  mutation_frequency_by_input_dna[,c("donor_id", "donor_label", "age", "n_var", "depth", "mutation_rate", "mutation_rate_lower", "mutation_rate_upper", "input_dna")]
+) %>%
+  data.table()
+
+## Order data by DNM accumulation rates
+final_df <- final_df %>% left_join(., dnm_accumulation[,c("donor_id", "dnm_accumulation", "age_diff", "text_label")], by = "donor_id")
+final_df$text_label <- factor(final_df$text_label, levels=donor_order)
+final_df$input_dna <- factor(final_df$input_dna, levels=c("Overall", "500ng", "200ng"))
+```
+
+## Generate plot {.tabset}
+### Plot by donor
+```{r, message=FALSE}
+longitudinal_plot_by_donor <- 
+  ggplot(final_df, aes(x = age, y = mutation_rate, group = input_dna, color = input_dna)) +
+  geom_line(aes(linetype = input_dna), show.legend = FALSE) +
+  geom_point() +
+  facet_wrap(~text_label, axes = "margins", ncol = 3, nrow = 3) + 
+  xlab("Age") +
+  ylab(expression(paste("Mutation Frequency (x", 10^-8, ")"))) +
+  theme_bw() +
+  geom_errorbar(aes(ymin = mutation_rate_lower, ymax = mutation_rate_upper), width=0.1) + 
+  scale_y_continuous(limits = c(1.5e-8, 1.2e-7), breaks = seq(1.5e-8, 1.2e-7, 2e-8), labels = seq(2e-8, 1.2e-7, 2e-8)*10^8) + 
+  scale_x_continuous(limits = c(25, 75), breaks = seq(25, 75, 10)) +
+  scale_color_manual("legend", 
+                      values = c("200ng" = "lightgrey", "500ng" = "#848884", "Overall" = "#67A9CF", 
+                                "D127" = "#67A9CF",
+                                "D091" = "#67A9CF", 
+                                "D125" = "#67A9CF", 
+                                "D130" = "#67A9CF", 
+                                "D188" = "#67A9CF",
+                                "D209" = "#67A9CF",
+                                "D212" = "#67A9CF", 
+                                "D244" = "#67A9CF")) +
+  guides(color = guide_legend(title = "Mutation Rate Group"))  +
+  scale_linetype_manual(values = c("200ng" = "dotted", "500ng" = "dashed", "Overall" = "solid",
+                                    "D127" = "solid",
+                                    "D091" = "solid", 
+                                    "D125" = "solid", 
+                                    "D130" = "solid", 
+                                    "D188" = "solid",
+                                    "D209" = "solid",
+                                    "D212" = "solid", 
+                                    "D244" = "solid")) +
+  theme(
+    strip.background = element_blank(), 
+    strip.text = element_text(size = 8, face="bold", hjust = 0, color = "black"),
+    panel.grid.minor = element_blank(), 
+    panel.grid.major.x = element_blank(), 
+    axis.title.y = element_text(color = "black", size = 12), 
+    axis.text.y = element_text(color = "black", size = 10),
+    axis.ticks.y = element_line(color = "black"), 
+    axis.title.x = element_text(color = "black", size = 12),
+    axis.text.x = element_text(color = "black", size = 10),
+    axis.ticks.x = element_line(color = "black"),
+    legend.position = "top", 
+    legend.direction = "vertical", 
+    legend.title = element_text(size = 9),
+    legend.text = element_text(size = 7),
+    legend.key.spacing.y = unit(0.1, "cm")
+  )
+longitudinal_plot_by_donor <- reposition_legend(longitudinal_plot_by_donor, "center", panel = "panel-3-3")
+print(longitudinal_plot_by_donor)
+```
+
+### Plot with all donors
+```{r, message=FALSE}
+## Generate plot with all donors
+## Get information for all donors panel
+overall_df <- final_df[input_dna == "Overall"]
+overall_df$text_label <- paste0("All: ", round(mean(dnm_accumulation$dnm_accumulation), 2), " DNMs/year")
+overall_df$input_dna <- overall_df$donor_id
+
+longitudinal_plot_all_donors <- ggplot(overall_df, aes(x = age, y = mutation_rate, group = input_dna, color = input_dna)) +
+  geom_line(aes(linetype = input_dna), show.legend = FALSE) +
+  geom_point() +
+  facet_wrap2(~text_label, axes = "all", remove_labels = "x", ncol = 4, nrow = 2) + 
+  xlab("Age") +
+  ylab(expression(paste("Mutation Frequency (x", 10^-8, ")"))) +
+  theme_bw() +
+  geom_errorbar(aes(ymin = mutation_rate_lower, ymax = mutation_rate_upper), width=0.1) + 
+  scale_y_continuous(limits = c(2e-8, 1.2e-7), breaks = seq(2e-8, 1.2e-7, 2e-8), labels = seq(2e-8, 1.2e-7, 2e-8)*10^8) + 
+  scale_x_continuous(limits = c(25, 75), breaks = seq(25, 75, 10)) +
+  scale_color_manual("legend", 
+                      values = c("200ng" = "lightgrey", "500ng" = "#848884", "Overall" = "#67A9CF", 
+                                "D127" = "#67A9CF",
+                                "D091" = "#67A9CF", 
+                                "D125" = "#67A9CF", 
+                                "D130" = "#67A9CF", 
+                                "D188" = "#67A9CF",
+                                "D209" = "#67A9CF",
+                                "D212" = "#67A9CF", 
+                                "D244" = "#67A9CF")) +
+  guides(color = guide_legend(title = "Mutation Rate Group"))  +
+  scale_linetype_manual(values = c("200ng" = "dotted", "500ng" = "dashed", "Overall" = "solid",
+                                  "D127" = "solid",
+                                  "D091" = "solid", 
+                                  "D125" = "solid", 
+                                  "D130" = "solid", 
+                                  "D188" = "solid",
+                                  "D209" = "solid",
+                                  "D212" = "solid", 
+                                  "D244" = "solid")) +
+  theme(
+    strip.background = element_blank(), 
+    strip.text = element_text(size = 9, face="bold", hjust = 0, color = "black"),
+    panel.grid.minor = element_blank(), 
+    panel.grid.major.x = element_blank(), 
+    axis.title.y = element_blank(), 
+    axis.text.y = element_text(color = "black", size = 10),
+    axis.ticks.y = element_line(color = "black"), 
+    axis.title.x = element_text(color = "black", size = 12),
+    axis.text.x = element_text(color = "black", size = 10),
+    axis.ticks.x = element_line(color = "black"),
+    legend.position = "none"
+  )
+print(longitudinal_plot_all_donors)  
+```
+
+### Combine plots
+```{r, message=FALSE}
+## Combine plots
+p <- plot_grid(longitudinal_plot_by_donor, longitudinal_plot_all_donors, 
+               ncol = 2, nrow = 1, rel_widths = c(0.6, 0.4))
+print(p)
+ggsave(paste0(main_figure_dir, "/Figure 2.pdf"), plot = p, width = 7.5, height = 3.5)  
+```
+
+## Statistical tests
+### Poisson model with log link
+
+Overdispersion test suggests that the Poisson interaction model is not overdispersed. Will therefore proceed with Poisson models.
+
+```{r, message=FALSE}
+no_donor_id <- glm(n_var ~ age + offset(log(depth)), data = final_df, family = poisson(link = "log")) 
+donor_id.additive <- glm(n_var ~ age + donor_id + offset(log(depth)), data = final_df, family = poisson(link = "log"))
+donor_id.interaction <- glm(n_var ~ age * donor_id + offset(log(depth)), data = final_df, family = poisson(link = "log"))
+
+print("Test for overdispersion...")
+print(AER::dispersiontest(donor_id.interaction))
+```
+
+### Poisson model summaries {.tabset}
+## No donor ID
+```{r, message=FALSE}
+print(summary(no_donor_id))
+```
+## Additive with donor_id
+```{r, message=FALSE}
+print(summary(donor_id.additive))
+```
+## Interaction with donor_id
+```{r, message=FALSE}
+print(summary(donor_id.interaction))
+```
+
+### Anova test
+
+Anova test shows that adding the donor ID term with an age interaction sigificantly improves the model fit
+
+```{r, message=FALSE}
+## additive vs interaction
+res <- anova(donor_id.additive, donor_id.interaction, test = "Chisq")
+print(res)
+print(res$`Pr(>Chi)`[2])
+
+## No donor id vs interaction
+res <- anova(no_donor_id, donor_id.interaction, test = "Chisq")
+print(res)
+print(res$`Pr(>Chi)`[2])
+```

@@ -1,0 +1,1294 @@
+---
+title: "Supplementary Tables and Figures"
+author: ""
+date: ""
+output: 
+  html_document:
+    fig_height: 3
+    fig_width: 5
+  pdf_document:
+    fig_height: 3
+    fig_width: 5
+  word_document:
+    fig_height: 3
+    fig_width: 5
+---
+
+# Setup
+```{r, setup, message=FALSE, warning=FALSE}
+## Load in datasets
+source("/scratch/ucgd/lustre-labs/quinlan/u1240855/normo-vs-oligo/R/normo-vs-oligo-data-setup.r")
+setup_list <- setup_data()
+
+sample_metadata_complete <- setup_list$sample_metadata_complete
+main_samples_metadata <- setup_list$main_samples_metadata
+donor_table <- setup_list$donor_table
+main_samples <- main_samples_metadata$sample
+
+plotted_samples <- c(main_samples, sample_metadata_complete[sample_metadata_complete$include == TRUE & cohort == "Longitudinal"]$sample) %>% unique()
+
+mutations <- setup_list$mutations
+mutations_filtered <- setup_list$mutations_filtered
+downsampled_mutations_filtered <- setup_list$downsampled_mutations_filtered
+main_samples_mutation_signatures <- setup_list$main_samples_mutation_signatures
+
+sample_coverage <- setup_list$sample_coverage
+sample_coverage_interval <- setup_list$sample_coverage_interval
+downsampled_sample_coverage <- setup_list$downsampled_sample_coverage
+
+main_figure_dir <- setup_list$main_figure_dir
+supplementary_figure_dir <- setup_list$supplementary_figure_dir
+table_dir <- setup_list$table_dir
+```
+
+# Supplementary Table - Get % of duplex bases removed {.tabset}
+## Generate dataset
+```{r, message=FALSE}
+duplex_bases_removed <- sample_coverage %>%
+  left_join(., sample_metadata_complete[,c("sample", "input_dna", "fertility_status", "tissue", "genomex_id", "include")], by = c("sample")) %>%
+  filter(include == TRUE) %>%
+  filter(probe_filter_threshold %in% c("all_intervals.none_filters.baseline", "subset_intervals.all_filters.baseline_remove_recurrence")) %>%
+  group_by(sample, input_dna, fertility_status, tissue, genomex_id) %>%
+  mutate(prefiltered_depth = total_depth[probe_filter_threshold == "all_intervals.none_filters.baseline"], 
+         filtered_depth = total_depth[probe_filter_threshold == "subset_intervals.all_filters.baseline_remove_recurrence"]) %>%
+  group_by(sample, input_dna, fertility_status, tissue, genomex_id, prefiltered_depth, filtered_depth) %>%
+  summarise(fraction_removed = ((prefiltered_depth - filtered_depth) / prefiltered_depth)) %>%       
+  data.table()            
+
+normo_200ng_main <- duplex_bases_removed[genomex_id == "19610R" & input_dna == "200ng"] %>% mutate(project_id = "Normozoospermic (200ng)")
+normo_500ng_main <- duplex_bases_removed[genomex_id == "19610R" & input_dna == "500ng"] %>% mutate(project_id = "Normozoospermic 500ng Replicate")
+normo_200ng_rep <- duplex_bases_removed[genomex_id == "19959R" & input_dna == "200ng"] %>% mutate(project_id = "Normozoospermic 200ng Reprepped")
+oligo_200ng_main <- duplex_bases_removed[genomex_id == "20070R"] %>% mutate(project_id = "Oligozoospermic (200ng)")
+oligo_200ng_rep <- duplex_bases_removed[genomex_id == "20963R"] %>% mutate(project_id = "Oligozoospermic 200ng Replicate")
+ 
+final_duplex_bases_removed <- do.call(rbind, list(normo_200ng_main, normo_500ng_main, normo_200ng_rep, oligo_200ng_main, oligo_200ng_rep))
+
+print(mean(final_duplex_bases_removed$fraction_removed))
+print(sd(final_duplex_bases_removed$fraction_removed))
+```
+## Print stats
+```{r, message=FALSE}
+print("Mean % of duplex bases removed in normozoospermic men:")
+stats_duplex_bases_removed <- final_duplex_bases_removed %>%
+  group_by(project_id) %>%
+  reframe(mean_fraction_removed = mean(fraction_removed),
+          sd_fraction_removed = sd(fraction_removed),
+          range = paste0(min(fraction_removed), "-", max(fraction_removed)),
+          n_samples = n_distinct(sample)) %>%
+  data.table()   
+print(stats_duplex_bases_removed)  
+
+write.table(stats_duplex_bases_removed, file = paste0(table_dir, "/Supplementary Table - duplex_bases_removed.txt"), sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+# Supplementary Table - Get % of mutations removed {.tabset}
+## Generate dataset
+```{r, message=FALSE}
+## Get prefiltered n_var count
+n_var.prefiltered <- mutations %>%
+  left_join(., sample_metadata_complete[,c("sample", "include")], by = c("sample")) %>%
+  filter(include == TRUE) %>%
+  group_by(sample, genomex_id, input_dna, tissue, fertility_status) %>%
+  summarise(n_var_prefiltered = n_distinct(var_coord))
+
+## Get post filtered n_var count
+n_var.postfiltered <- mutations_filtered %>%
+  left_join(., sample_metadata_complete[,c("sample", "include")], by = c("sample")) %>%
+  filter(include == TRUE) %>%
+  group_by(sample, genomex_id, input_dna, tissue, fertility_status) %>%
+  summarise(n_var_postfiltered = n_distinct(var_coord))  
+
+## Get the fraction of mutations removed
+n_var_removed <- left_join(n_var.prefiltered, n_var.postfiltered, by = c("sample", "genomex_id", "input_dna", "tissue", "fertility_status")) %>%
+  mutate(fraction_removed = (n_var_prefiltered - n_var_postfiltered) / n_var_prefiltered) %>%
+  data.table()
+
+
+normo_200ng_main <- n_var_removed[genomex_id == "19610R" & input_dna == "200ng"] %>% mutate(project_id = "Normozoospermic (200ng)")
+normo_500ng_main <- n_var_removed[genomex_id == "19610R" & input_dna == "500ng"] %>% mutate(project_id = "Normozoospermic 500ng Replicate")
+normo_200ng_rep <- n_var_removed[genomex_id == "19959R" & input_dna == "200ng"] %>% mutate(project_id = "Normozoospermic 200ng Reprepped")
+oligo_200ng_main <- n_var_removed[genomex_id == "20070R"] %>% mutate(project_id = "Oligozoospermic (200ng)")
+oligo_200ng_rep <- n_var_removed[genomex_id == "20963R"] %>% mutate(project_id = "Oligozoospermic 200ng Replicate")
+ 
+final_mutations_removed <- do.call(rbind, list(normo_200ng_main, normo_500ng_main, normo_200ng_rep, oligo_200ng_main, oligo_200ng_rep))  
+
+print(mean(final_mutations_removed$fraction_removed))
+print(sd(final_mutations_removed$fraction_removed))
+```
+## Print stats
+```{r, message=FALSE}
+print("Mean % of mutations removed:")
+stats_mutations_removed <- final_mutations_removed %>%
+  group_by(project_id) %>%
+  reframe(mean_fraction_removed = mean(fraction_removed),
+          sd_fraction_removed = sd(fraction_removed),
+          range = paste0(min(fraction_removed), "-", max(fraction_removed)),
+          n_samples = n_distinct(sample)) %>%
+  data.table() 
+print(stats_mutations_removed)    
+
+write.table(stats_mutations_removed, file = paste0(table_dir, "/Supplementary Table - mutations_removed.txt"), sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+
+# Supplementary Figure - Ponytail plot {.tabset}
+## Set up ponytail coverage dataset
+```{r, message=FALSE}
+ponytail_file <- "/scratch/ucgd/lustre-labs/quinlan/u1240855/normo-vs-oligo/manuscript_data/final_datasets/ponytail_coverage.txt"
+ponytail_coverage <- fread(ponytail_file, integer64 = "numeric")
+ponytail_df <- ponytail_coverage %>%
+  left_join(sample_metadata_complete[,c("sample", "input_dna", "fertility_status", "tissue", "genomex_id", "include", "project_id")], by = c("sample")) %>%
+  filter(include == TRUE) %>%
+  mutate(tissue_label = ifelse(tissue == "Sperm_DNA", yes = "Sperm", no = "Blood")) %>%
+  data.table()
+
+prefiltered_df <- ponytail_df[applied_filter == "none_filters" & probe == "all_intervals" & threshold == "baseline"] %>%
+  mutate(filter = "Pre-filtered")
+filtered_df <- ponytail_df[applied_filter == "all_filters" & probe == "subset_intervals" & threshold == "baseline"] %>%
+  mutate(filter = "Post-filtered")
+
+final_df <- rbind(prefiltered_df, filtered_df)
+final_df$filter <- factor(final_df$filter, levels = c("Pre-filtered", "Post-filtered"))
+
+final_df$project_id <- factor(final_df$project_id, levels = c("Normozoospermic (200ng)", 
+                                                              "Oligozoospermic (200ng)",
+                                                              "Normozoospermic (500ng Replicate)", 
+                                                              "200ng Resequenced",
+                                                              "500ng Resequenced", 
+                                                              "200ng Replicate"))
+```
+## Determine point at which 50% of bases are covered
+```{r, message=FALSE}
+ponytail_coordinates <- final_df %>%
+  mutate(distance_to_50per= abs(prop_bases_above_threshold - 0.5)) %>%
+  group_by(filter, fertility_status, input_dna, tissue, sample, genomex_id, project_id) %>%
+  mutate(min_distance_50 = min(distance_to_50per), 
+         is_min_distance_50 = ifelse(distance_to_50per == min_distance_50, 
+                                     yes = "yes", 
+                                     no = "no")) %>%
+  filter(is_min_distance_50 == "yes") %>%
+  group_by(filter, fertility_status, input_dna, tissue, genomex_id, project_id) %>%
+  mutate(median50 = median(depth_cutoff)) %>%
+  select(filter, fertility_status, input_dna, tissue, genomex_id, project_id, median50) %>%
+  unique() %>%
+  mutate(tissue_label = ifelse(tissue == "Sperm_DNA", yes = "Sperm", no = "Blood")) %>%
+  data.table()
+```
+## Generate plot
+```{r, message=FALSE}
+normo_ponytail_plot <- ggplot(final_df[fertility_status == "Normozoospermic"], aes(x = depth_cutoff, y = prop_bases_above_threshold, group = sample, color = fertility_status)) +
+  geom_line() + 
+  theme_bw() + 
+  xlab("Depth Cutoff") + 
+  ylab("% Bases With Coverage > Depth Cutoff") + 
+  facet_nested(tissue_label + filter ~  project_id, 
+               scales = "free_x") + 
+  scale_color_manual("Fertility Status", values =  c("Normozoospermic" = "#67A9CF", "Oligozoospermic" = "#EF8A62")) + 
+  geom_segment(data = ponytail_coordinates[fertility_status == "Normozoospermic"], aes(x = median50, xend = median50, y = 0, yend = 0.5), linetype = "dashed", color = "red", inherit.aes = FALSE) + 
+  geom_segment(data = ponytail_coordinates[fertility_status == "Normozoospermic"], aes(x = 0, xend = median50, y = 0.5, yend = 0.5), linetype = "dashed", color = "red", inherit.aes = FALSE) + 
+  theme(strip.text = element_text(color = "black", size = 12), 
+        strip.background = element_rect(color = "black", fill = NA), 
+        legend.position = "top", 
+        panel.grid.minor = element_blank(),
+        axis.title.x = element_text(color = "black", size = 14),
+        axis.ticks.x = element_line(color = "black"),
+        axis.text.x = element_text(color = "black", size = 12),
+        axis.title.y = element_text(color = "black", size = 14),
+        axis.ticks.y = element_line(color = "black"),
+        axis.text.y = element_text(color = "black", size = 12), 
+        legend.text = element_text(color = "black", size = 12), 
+        legend.title = element_text(color = "black", size = 14)) + 
+  geom_text(data = ponytail_coordinates[fertility_status == "Normozoospermic"], aes(x = median50, y = 0.55, label = median50), inherit.aes = FALSE)
+
+oligo_ponytail_plot <- ggplot(final_df[fertility_status == "Oligozoospermic"], aes(x = depth_cutoff, y = prop_bases_above_threshold, group = sample, color = fertility_status)) +
+  geom_line() + 
+  theme_bw() + 
+  xlab("Depth Cutoff") + 
+  ylab("% Bases With Coverage > Depth Cutoff") + 
+  facet_nested(tissue_label + filter ~  project_id, 
+               scales = "free_x") + 
+  scale_color_manual("Fertility Status", values =  c("Normozoospermic" = "#67A9CF", "Oligozoospermic" = "#EF8A62")) + 
+  geom_segment(data = ponytail_coordinates[fertility_status == "Oligozoospermic"], aes(x = median50, xend = median50, y = 0, yend = 0.5), linetype = "dashed", color = "red", inherit.aes = FALSE) + 
+  geom_segment(data = ponytail_coordinates[fertility_status == "Oligozoospermic"], aes(x = 0, xend = median50, y = 0.5, yend = 0.5), linetype = "dashed", color = "red", inherit.aes = FALSE) + 
+  theme(strip.text = element_text(color = "black", size = 12), 
+        strip.background = element_rect(color = "black", fill = NA), 
+        legend.position = "top", 
+        panel.grid.minor = element_blank(),
+        axis.title.x = element_text(color = "black", size = 14),
+        axis.ticks.x = element_line(color = "black"),
+        axis.text.x = element_text(color = "black", size = 12),
+        axis.title.y = element_text(color = "black", size = 14),
+        axis.ticks.y = element_line(color = "black"),
+        axis.text.y = element_text(color = "black", size = 12), 
+        legend.text = element_text(color = "black", size = 12), 
+        legend.title = element_text(color = "black", size = 14)) + 
+  geom_text(data = ponytail_coordinates[fertility_status == "Oligozoospermic"], aes(x = median50, y = 0.55, label = median50), inherit.aes = FALSE) 
+
+ponytail_plot <- plot_grid(normo_ponytail_plot, oligo_ponytail_plot, ncol = 1)
+print(ponytail_plot)  
+
+ggsave(paste0(supplementary_figure_dir, "/ponytail_plot.pdf"), plot = ponytail_plot, width = 10, height = 12)
+```
+
+# Supplementary Figure - SFS {.tabset}
+## Set up SFS dataset
+```{r, message=FALSE}
+sfs_df <- mutations_filtered %>%
+  left_join(., sample_metadata_complete[,c("sample", "include", "project_id")], by = c("sample")) %>%
+  filter(include == TRUE) %>%
+  data.table()
+
+sfs_df$alt_count_v3 <- as.numeric(sfs_df$alt_count_v3)
+sfs_df$tissue_label <- ifelse(sfs_df$tissue == "Sperm_DNA", "Sperm", "Blood")
+
+
+sfs_df <- sfs_df %>% 
+  mutate(project_id = ifelse(genomex_id == "19959R", yes = "Normozoospermic (200ng)", no = project_id)) %>%
+  mutate(project_id = ifelse(genomex_id == "20963R" & fertility_status == "Oligozoospermic", yes = "Oligozoospermic (200ng)", no = project_id)) %>%
+  mutate(project_id = ifelse(genomex_id == "20963R" & fertility_status == "Normozoospermic", yes = "Normozoospermic (200ng)", no = project_id)) %>%
+  mutate(project_id = ifelse(genomex_id == "19610R" & input_dna == "500ng", yes = "Normozoospermic\n(500ng Replicate)", no = project_id)) %>%
+  data.table()
+
+
+sfs_df$project_id <- factor(sfs_df$project_id, levels = c("Normozoospermic (200ng)", 
+                                                          "Oligozoospermic (200ng)",
+                                                          "Normozoospermic\n(500ng Replicate)", 
+                                                          "200ng Reseqeuenced\nor Replicate",
+                                                          "500ng Resequenced"))
+                                                          
+final_sfs_df <- sfs_df %>%
+  group_by(project_id, tissue_label, fertility_status) %>%
+  mutate(n_var = n_distinct(var_coord)) %>%
+  group_by(project_id, tissue_label, fertility_status, n_var, alt_count_v3) %>%
+  summarise(n_var_sfs = n_distinct(var_coord)) %>%
+  mutate(fraction = n_var_sfs / n_var) %>%
+  data.table()
+```
+## Generate SFS plot
+```{r, message=FALSE}
+sfs_p <- ggplot(final_sfs_df, aes(x = alt_count_v3, y = fraction, fill = fertility_status)) + 
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(aes(label = paste0(round(n_var_sfs / n_var, digits = 4)*100)), vjust = -0.5, size = 3) +
+  theme_bw() + 
+  facet_nested(project_id ~ tissue_label) + 
+  scale_fill_manual("Fertility Status", values = c("Normozoospermic" = "#67A9CF", "Oligozoospermic" = "#EF8A62")) + 
+  scale_x_continuous(limits = c(0, 21), breaks = seq(0, 21, 1)) +
+  scale_y_continuous(limits = c(0, 1.15), breaks = seq(0, 1, 0.2)) +
+  theme(strip.text = element_text(color = "black", size = 12), 
+        strip.background = element_rect(color = "black", fill = NA), 
+        legend.position = "top", 
+        panel.grid.minor = element_blank(),
+        axis.title.x = element_text(color = "black", size = 14),
+        axis.ticks.x = element_line(color = "black"),
+        axis.text.x = element_text(color = "black", size = 12),
+        axis.title.y = element_text(color = "black", size = 14),
+        axis.ticks.y = element_line(color = "black"),
+        axis.text.y = element_text(color = "black", size = 12), 
+        legend.text = element_text(color = "black", size = 12), 
+        legend.title = element_text(color = "black", size = 14)) +
+  xlab("Alternate Allele Count") + 
+  ylab("Fraction of Mutations in Each Group")
+print(sfs_p)
+
+ggsave(paste0(supplementary_figure_dir, "/sfs_plot.pdf"), width = 13, height = 8)
+```
+
+# Supplementary Figure - Technical replicates {.tabset}
+## Set up technical replicates dataset
+```{r, message=FALSE}
+## Get donors with technical replicates
+tr_df <- mutations_filtered %>%
+  left_join(., sample_metadata_complete[,c("sample", "include")], by = c("sample")) %>%
+  filter(include == TRUE) %>%
+  group_by(donor_id, age, tissue, fertility_status) %>%
+  mutate(num_replicates = n_distinct(sample)) %>%
+  filter(num_replicates > 1) %>%
+  data.table()
+
+## Calculate mutation frequency
+tr_mr_df <- tr_df %>%
+  group_by(sample, genomex_id, donor_id, age, donor_label, age_group, input_dna, timepoint, tissue, fertility_status) %>%
+  summarise(n_var = n_distinct(var_coord)) %>%
+  left_join(., sample_coverage[probe_filter_threshold == "subset_intervals.all_filters.baseline_remove_recurrence", c("sample", "total_depth")], by = "sample") %>%
+  mutate(n_var_lower = qchisq(0.025, 2*n_var) / 2,
+         n_var_upper = qchisq(0.975, 2*(n_var + 1))/2) %>%
+  mutate(mutation_rate = n_var / total_depth,
+         mutation_rate.lower = n_var_lower / total_depth, 
+         mutation_rate.upper = n_var_upper / total_depth) %>%        
+  arrange(fertility_status, tissue, age) %>%
+  mutate(tissue_label = ifelse(tissue == "Sperm_DNA", "Sperm", "Blood")) %>%
+  mutate(tissue_label = ifelse(tissue == "Sperm_DNA", yes = "Sperm", no = "Blood")) %>%
+  mutate(x_lab = paste0(donor_label, "\n", tissue_label, "\n", age_group)) %>%
+  data.table()
+
+normo_200ng_main <- tr_mr_df[genomex_id == "19610R" & input_dna == "200ng"] %>% mutate(project_id = "Normozoospermic")
+normo_500ng_main <- tr_mr_df[genomex_id == "19610R" & input_dna == "500ng"] %>% mutate(project_id = "Normozoospermic 500ng Rep.")
+normo_200ng_rep <- tr_mr_df[genomex_id == "19959R" & input_dna == "200ng"] %>% mutate(project_id = "Normozoospermic 200ng Rep.")
+oligo_200ng_main <- tr_mr_df[genomex_id == "20070R" & sample != "20070X19"] %>% mutate(project_id = "Oligozoospermic")
+oligo_200ng_rep <- tr_mr_df[genomex_id == "20963R" | (genomex_id == "20070R" & donor_id == "J7VD" & tissue == "Sperm_DNA" & sample == "20070X19")] %>% 
+  mutate(project_id = "Oligozoospermic 200ng Rep.")
+
+final_tr_mr_df <- do.call(rbind, list(normo_200ng_main, normo_500ng_main, normo_200ng_rep, oligo_200ng_main, oligo_200ng_rep))
+
+## Get donor order
+donor_order <- final_tr_mr_df$x_lab %>% unique()
+final_tr_mr_df$x_lab <- factor(final_tr_mr_df$x_lab, levels = donor_order)  
+```
+## Generate plot
+```{r, message=FALSE}
+tr_plot <- ggplot(final_tr_mr_df, aes(x = x_lab, y = mutation_rate, fill = project_id)) + 
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_errorbar(aes(x = x_lab, ymin = mutation_rate.lower, ymax = mutation_rate.upper), 
+                position = position_dodge(width = 0.9), width = 0.25) +
+  theme_bw() + 
+  scale_fill_manual("", 
+                    values = c("Normozoospermic" = "#67A9CF", 
+                               "Normozoospermic 500ng Rep." = "#A1CAE1", 
+                               "Normozoospermic 200ng Rep." = "#3885b1", 
+                               "Oligozoospermic" = "#EF8A62", 
+                               "Oligozoospermic 200ng Rep." = "#f6bea7")) +
+  theme(legend.position = "top", 
+        panel.grid.minor = element_blank(),
+        axis.title.x = element_text(color = "black", size = 14),
+        axis.ticks.x = element_line(color = "black"),
+        axis.text.x = element_text(color = "black", size = 12),
+        axis.title.y = element_text(color = "black", size = 14),
+        axis.ticks.y = element_line(color = "black"),
+        axis.text.y = element_text(color = "black", size = 12), 
+        legend.text = element_text(color = "black", size = 12), 
+        legend.title = element_text(color = "black", size = 14)) +
+  xlab("Donor, Tissue, and Age") + 
+  ylab(expression(paste("Mutation Frequency (x", 10^7, ")"))) +
+  geom_vline(xintercept = 9.5, linetype = "dashed") + 
+  scale_y_continuous(limits = c(0, 2e-7), breaks = seq(0, 2e-7, 5e-8), labels = seq(0, 2e-7, 5e-8) * 10^7)
+print(tr_plot)
+
+ggsave(paste0(supplementary_figure_dir, "/technical_replicates_plot.pdf"), plot = tr_plot, width = 15, height = 6)
+```
+
+# Supplementary Figure - Downsampled technical replicates {.tabset}
+## Calculate mutation frequencies in main cohort samples
+```{r, message=FALSE}
+mr_df <- mutations_filtered %>%
+  left_join(., sample_metadata_complete[,c("sample", "include")], by = c("sample")) %>%
+  filter(include == TRUE & input_dna == "200ng" & fertility_status == "Normozoospermic" & genomex_id == "19610R") %>%
+  group_by(sample, donor_id, donor_label, age, age_group, input_dna, timepoint, tissue) %>%
+  summarise(n_var = n_distinct(var_coord)) %>%
+  left_join(., sample_coverage[probe_filter_threshold == "subset_intervals.all_filters.baseline_remove_recurrence", c("sample", "total_depth")], by = "sample") %>%
+  mutate(n_var_lower = qchisq(0.025, 2*n_var) / 2,
+         n_var_upper = qchisq(0.975, 2*(n_var + 1))/2) %>%
+  mutate(mutation_rate = n_var / total_depth,
+          mutation_rate.lower = n_var_lower / total_depth, 
+          mutation_rate.upper = n_var_upper / total_depth) %>%  
+  arrange(tissue, age, donor_id, donor_label) %>%
+  mutate(Pipeline = "Original") %>%
+  data.table()
+```
+## Calculate mutation frequencies in downsampled samples
+```{r, message=FALSE}
+downsampled_mr_df <- downsampled_mutations_filtered %>%
+  left_join(., sample_metadata_complete[,c("sample", "include")], by = c("sample")) %>%
+  filter(include == TRUE & input_dna == "200ng") %>%
+  group_by(sample, donor_id, donor_label, age, input_dna, timepoint, tissue, age_group) %>%
+  summarise(n_var = n_distinct(var_coord)) %>%
+  left_join(., downsampled_sample_coverage[probe_filter_threshold == "subset_intervals.all_filters.baseline_remove_recurrence", c("sample", "total_depth")], by = "sample") %>%
+  mutate(n_var_lower = qchisq(0.025, 2*n_var) / 2,
+         n_var_upper = qchisq(0.975, 2*(n_var + 1))/2) %>%
+  mutate(mutation_rate = n_var / total_depth,
+          mutation_rate.lower = n_var_lower / total_depth, 
+          mutation_rate.upper = n_var_upper / total_depth) %>%
+  arrange(tissue, age, donor_id, donor_label) %>%
+  mutate(Pipeline = "Downsampled") %>%
+  data.table()
+```
+## Combine datasets
+```{r, message=FALSE}
+final_mr_df <- rbind(mr_df, downsampled_mr_df) %>%
+  mutate(tissue_label = ifelse(tissue == "Sperm_DNA", "Sperm", "Blood"))
+final_mr_df$Pipeline <- factor(final_mr_df$Pipeline, levels = c("Original", "Downsampled"))
+final_mr_df$donor_label <-   paste0(final_mr_df$donor_label, "\n", final_mr_df$tissue_label, "\n", final_mr_df$age_group)
+donor_order <- naturalsort(final_mr_df$donor_label) %>% unique()
+final_mr_df$donor_label <- factor(final_mr_df$donor_label, levels = donor_order)
+```
+## Generate plot
+```{r, message=FALSE}
+downsampled_p <- ggplot(final_mr_df, aes(x = donor_label, y = mutation_rate, fill = Pipeline)) + 
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_errorbar(aes(x = donor_label, ymin = mutation_rate.lower, ymax = mutation_rate.upper), 
+                position = position_dodge(width = 0.9), width = 0.25) +
+  theme_bw() + 
+  scale_fill_manual("Pipeline", values = c("Original" = "#67A9CF", "Downsampled" = "#A1CAE1")) + 
+  facet_wrap(~ tissue_label, scales = "free", ncol = 1) + 
+  xlab("Donor, Tissue, and Age") +   
+  ylab(expression(paste("Mutation Frequency (x", 10^-7, ")"))) +
+  scale_y_continuous(limits = c(0, 4e-7), breaks = seq(0, 4e-7, 5e-8), labels = seq(0, 4e-7, 5e-8) * 10^7) +
+  theme(strip.text = element_text(color = "black", size = 12), 
+        strip.background = element_rect(color = "black", fill = NA), 
+        legend.position = "top", 
+        panel.grid.minor = element_blank(),
+        axis.title.x = element_text(color = "black", size = 14),
+        axis.ticks.x = element_line(color = "black"),
+        axis.text.x = element_text(color = "black", size = 12),
+        axis.title.y = element_text(color = "black", size = 14),
+        axis.ticks.y = element_line(color = "black"),
+        axis.text.y = element_text(color = "black", size = 12), 
+        legend.text = element_text(color = "black", size = 12), 
+        legend.title = element_text(color = "black", size = 14))
+print(downsampled_p)
+ggsave(paste0(supplementary_figure_dir, "/downsampled_plot.pdf"), plot = downsampled_p, width = 15, height = 6)
+```
+
+# Supplementary Figure - Consistent mutation burdens without matched samples {.tabset}
+## Get mutations from donors with matched samples
+```{r, message=FALSE}
+matched_donors <- donor_table[`Sperm Used?` == "Yes" & `Blood Used?` == "Yes"]$`Donor ID`
+```
+## Calculate mutation frequency from matched donor samples with within-donor recurrence
+```{r, message=FALSE}
+## Mutation frequency using within donor recurrence filter
+matched_donor_mr <- mutations %>%
+  left_join(., sample_metadata_complete[,c("sample", "include")], by = c("sample")) %>%
+  filter(include == TRUE) %>%
+  filter(donor_id %in% matched_donors & input_dna == "200ng" & sample %in% main_samples) %>%
+  filter((
+          (var_source == "likely_denovo") & ## AF < 0.2 & read support from pysam pielup
+            (final_var_filter == "PASS") & ## Combines vardict and twinstrand filters
+            (read_N_prop < 0.05) &
+            (site_N_freq < 0.05) &
+            (hp_distance != 0) &
+            (read_pos >= 15 & read_pos <= (read_length - 15)) &
+            (fraguracy_error_count <= 3) &
+            (within_donor_recurrent %in% c(FALSE)) &
+            (within_cohort_recurrent %in% c(FALSE)) &
+            (across_cohort_recurrent %in% c(FALSE)))) %>%
+  group_by(sample, donor_id, age, donor_label, age_group, input_dna, timepoint, tissue, fertility_status) %>%
+  summarise(n_var = n_distinct(var_coord)) %>%
+  left_join(., sample_coverage[probe_filter_threshold == "subset_intervals.all_filters.baseline_remove_recurrence", c("sample", "total_depth")], by = "sample") %>%
+  mutate(n_var_lower = qchisq(0.025, 2*n_var) / 2,
+         n_var_upper = qchisq(0.975, 2*(n_var + 1))/2) %>%
+  mutate(mutation_rate = n_var / total_depth,
+          mutation_rate.lower = n_var_lower / total_depth, 
+          mutation_rate.upper = n_var_upper / total_depth) %>%
+  arrange(tissue, age, donor_id) %>%
+  mutate(Strategy = ifelse(fertility_status == "Normozoospermic", 
+                           yes = "With matched tissue filter (Normozoospermic)", 
+                           no = "With matched tissue filter (Oligozoospermic)")) %>%
+  data.table() 
+```
+## Calculate mutation frequency from matched donor samples without within-donor recurrence
+```{r, message=FALSE}
+## Mutation frequency without within donor recurrence filter
+test_mr_df <- mutations %>%
+  left_join(., sample_metadata_complete[,c("sample", "include")], by = c("sample")) %>%
+  filter(include == TRUE) %>%
+  filter(donor_id %in% matched_donors & input_dna == "200ng" & sample %in% main_samples) %>%
+  filter((
+          (var_source == "likely_denovo") & ## AF < 0.2 & read support from pysam pielup
+            (final_var_filter == "PASS") & ## Combines vardict and twinstrand filters
+            (read_N_prop < 0.05) &
+            (site_N_freq < 0.05) &
+            (hp_distance != 0) &
+            (read_pos >= 15 & read_pos <= (read_length - 15)) &
+            (fraguracy_error_count <= 3) &
+            # (within_donor_recurrent %in% c(FALSE)) &
+            (within_cohort_recurrent %in% c(FALSE)) &
+            (across_cohort_recurrent %in% c(FALSE)))) %>%
+  group_by(sample, donor_id, donor_label, age, age_group, input_dna, timepoint, tissue, fertility_status) %>%
+  summarise(n_var = n_distinct(var_coord)) %>%
+  left_join(., sample_coverage[probe_filter_threshold == "subset_intervals.all_filters.baseline_remove_recurrence", c("sample", "total_depth")], by = "sample") %>%
+  mutate(n_var_lower = qchisq(0.025, 2*n_var) / 2,
+         n_var_upper = qchisq(0.975, 2*(n_var + 1))/2) %>%
+  mutate(mutation_rate = n_var / total_depth,
+          mutation_rate.lower = n_var_lower / total_depth, 
+          mutation_rate.upper = n_var_upper / total_depth) %>%
+  arrange(tissue, age, donor_id) %>%
+  mutate(Strategy = ifelse(fertility_status == "Normozoospermic", 
+                           yes = "No matched tissue filter (Normozoospermic)", 
+                           no = "No matched tissue filter (Oligozoospermic)")) %>%
+  data.table() 
+```
+## Combine datasets and plot
+```{r, message=FALSE}
+final_mr_df <- rbind(matched_donor_mr, test_mr_df)
+final_mr_df$Strategy <- factor(final_mr_df$Strategy, 
+                               levels = c("With matched tissue filter (Normozoospermic)", 
+                                          "No matched tissue filter (Normozoospermic)",
+                                          "With matched tissue filter (Oligozoospermic)",
+                                          "No matched tissue filter (Oligozoospermic)"))
+final_mr_df$tissue_label <- ifelse(final_mr_df$tissue == "Sperm_DNA", "Sperm", "Blood")
+final_mr_df$donor_label <- paste0(final_mr_df$donor_label, "\n", final_mr_df$tissue_label, "\n", final_mr_df$age_group)
+
+donor_order <- naturalsort(final_mr_df$donor_label) %>% unique()
+final_mr_df$donor_label <- factor(final_mr_df$donor_label, levels = donor_order)
+```
+## Normozoospermic plot
+```{r, message=FALSE}
+normo_filter_p <- ggplot(final_mr_df[fertility_status == "Normozoospermic"], aes(x = donor_label, y = mutation_rate, fill = Strategy)) + 
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_errorbar(aes(x = donor_label, ymin = mutation_rate.lower, ymax = mutation_rate.upper), 
+                position = position_dodge(width = 0.9), width = 0.25) +
+  theme_bw() + 
+  scale_fill_manual("Strategy", values = c("With matched tissue filter (Normozoospermic)" = "#67A9CF", 
+                                           "No matched tissue filter (Normozoospermic)" = "#A1CAE1", 
+                                           "With matched tissue filter (Oligozoospermic)" = "#EF8A62",
+                                           "No matched tissue filter (Oligozoospermic)" = "#f6bea7")) + 
+  facet_wrap( ~ tissue_label, scales = "free", ncol = 1) + 
+  xlab("Donor, Tissue, and Age") + 
+  ylab(expression(paste("Mutation Frequency (x", 10^-7, ")"))) +
+  scale_y_continuous(limits = c(0, 3.5e-7), breaks = seq(0, 3.5e-7, 5e-8), labels = seq(0, 3.5e-7, 5e-8) * 10^7) +
+  theme(strip.text = element_text(color = "black", size = 12), 
+        strip.background = element_rect(color = "black", fill = NA), 
+        legend.position = "top", 
+        panel.grid.minor = element_blank(),
+        axis.title.x = element_blank(),
+        axis.ticks.x = element_line(color = "black"),
+        axis.text.x = element_text(color = "black", size = 12),
+        axis.title.y = element_text(color = "black", size = 14),
+        axis.ticks.y = element_line(color = "black"),
+        axis.text.y = element_text(color = "black", size = 12), 
+        legend.text = element_text(color = "black", size = 12), 
+        legend.title = element_text(color = "black", size = 14))
+print(normo_filter_p)
+```
+## Oligozoospermic plot
+```{r, message=FALSE}
+oligo_filter_p <- ggplot(final_mr_df[fertility_status == "Oligozoospermic"], aes(x = donor_label, y = mutation_rate, fill = Strategy)) + 
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_errorbar(aes(x = donor_label, ymin = mutation_rate.lower, ymax = mutation_rate.upper), 
+                position = position_dodge(width = 0.9), width = 0.25) +
+  theme_bw() + 
+  scale_fill_manual("Strategy", values = c("With matched tissue filter (Normozoospermic)" = "#67A9CF", 
+                                           "No matched tissue filter (Normozoospermic)" = "#A1CAE1", 
+                                           "With matched tissue filter (Oligozoospermic)" = "#EF8A62",
+                                           "No matched tissue filter (Oligozoospermic)" = "#f6bea7")) + 
+  facet_wrap( ~ tissue_label, scales = "free", ncol = 2) + 
+  xlab("Donor, Tissue, and Age") + 
+  ylab(expression(paste("Mutation Frequency (x", 10^-7, ")"))) +
+  scale_y_continuous(limits = c(0, 2e-7), breaks = seq(0, 2e-7, 5e-8), labels = seq(0, 2e-7, 5e-8) * 10^7) +
+  theme(strip.text = element_text(color = "black", size = 12), 
+        strip.background = element_rect(color = "black", fill = NA), 
+        legend.position = "top", 
+        panel.grid.minor = element_blank(),
+        axis.title.x = element_text(color = "black", size = 14),
+        axis.ticks.x = element_line(color = "black"),
+        axis.text.x = element_text(color = "black", size = 12),
+        axis.title.y = element_text(color = "black", size = 14),
+        axis.ticks.y = element_line(color = "black"),
+        axis.text.y = element_text(color = "black", size = 12), 
+        legend.text = element_text(color = "black", size = 12), 
+        legend.title = element_text(color = "black", size = 14))
+print(oligo_filter_p)
+```
+## Combine plots
+```{r, message=FALSE}
+filter_p <- plot_grid(normo_filter_p, oligo_filter_p, ncol = 1, rel_heights = c(1.5, 1))
+print(filter_p)
+
+ggsave(paste0(supplementary_figure_dir, "/Matched donor mutation frequency.pdf"), plot = filter_p, width = 15, height = 10)
+```
+
+# Supplementary Figure - Mutation spectra {.tabset}
+## Binomial regression analysis
+```{r, message=FALSE}
+get_subtype_regression <- function(model_df, subtype, tissue, sperm_parameter = "avgMotil") {
+
+  subtype_model_df <- data.table(model_df[subtype_collapsed == subtype])
+
+  normo_df <- subtype_model_df[fertility_status == "Normozoospermic"]
+  oligo_df <- subtype_model_df[fertility_status == "Oligozoospermic"]
+
+  if ((tissue == "Sperm_DNA")) {
+    # print("Interaction model...")
+    interaction_formula <- as.formula(paste0("fraction ~ age * fertility_status + ", sperm_parameter))
+    subtype_model.interaction <- glm(interaction_formula, 
+                                     data = subtype_model_df, 
+                                     family = binomial(link = "logit"),
+                                     weights = subtype_model_df$total_n_var)
+
+    # print("Additive model...")
+    additive_formula <- as.formula(paste0("fraction ~ age + fertility_status + ", sperm_parameter))
+    subtype_model.additive <- glm(additive_formula, 
+                                  data = subtype_model_df, 
+                                  family = binomial(link = "logit"),
+                                  weights = subtype_model_df$total_n_var)
+
+    # print("Normozoospermic model...")
+    normo_formula <- as.formula(paste0("fraction ~ age + ", sperm_parameter))
+    subtype_normo_model <- glm(normo_formula, 
+                               data = normo_df, 
+                               family = binomial(link = "logit"), 
+                               weights = normo_df$total_n_var)
+    
+    # print("Oligozoospermic model...")
+    oligo_formula <- as.formula(paste0("fraction ~ age + ", sperm_parameter))
+    subtype_oligo_model <- glm(oligo_formula,
+                                data = oligo_df, 
+                                family = binomial(link = "logit"), 
+                                weights = oligo_df$total_n_var)                                     
+  }
+
+  if (tissue == "Blood_DNA") {
+    subtype_model.interaction <- glm(fraction ~ age * fertility_status, 
+                                     data = subtype_model_df, 
+                                     family = binomial(link = "logit"),
+                                     weights = subtype_model_df$total_n_var)
+
+    subtype_model.additive <- glm(fraction ~ age + fertility_status, 
+                                  data = subtype_model_df, 
+                                  family = binomial(link = "logit"),
+                                  weights = subtype_model_df$total_n_var)
+
+    subtype_normo_model <- glm(fraction ~ age, 
+                               data = normo_df, 
+                               family = binomial(link = "logit"), 
+                               weights = normo_df$total_n_var)   
+
+    subtype_oligo_model <- glm(fraction ~ age,
+                               data = oligo_df, 
+                               family = binomial(link = "logit"), 
+                               weights = oligo_df$total_n_var)
+  
+  }
+
+  # ---------- Determine if additive or interaction model is a better fit ----------
+
+  print("Comparing additive and interaction models...")
+
+  res <- lmtest::lrtest(subtype_model.interaction, subtype_model.additive)
+  p_value <- res$`Pr(>Chisq)`[2]
+
+  if (p_value > 0.05) {
+    print(paste0("No interaction effect for ", subtype))
+    final_model <- subtype_model.additive
+    model_strategy <- "Additive"
+  } else {
+    print(paste0("Interaction effect for ", subtype, ". Consider using the interaction model..."))
+    final_model <- subtype_model.interaction
+    model_strategy <- "Interaction"
+  }
+
+
+  # ---------- Combine coefficients from each regression model ----------
+
+  ## Function to store model coefficients as a dataframe
+  get_model_coefficients <- function(model, subtype, model_name) {
+    res <- summary(model)$coefficients
+    model_coefficients <- res %>% data.table()
+    colnames(model_coefficients) <- c("Estimate", "std_error", "z_value", "p_value")
+    model_coefficients$aic <- model$aic
+    model_coefficients$term <- rownames(res)
+    model_coefficients$subtype <- subtype
+    model_coefficients$model <- model_name
+
+    return(model_coefficients)
+  }
+
+  ## Get coefficients from each model
+  subtype_model.interaction.coef <- get_model_coefficients(model = subtype_model.interaction, subtype = subtype, model_name = "interaction")
+  subtype_model.additive.coef <- get_model_coefficients(model = subtype_model.additive, subtype = subtype, model_name = "additive")
+  subtype_normo_model.coef <- get_model_coefficients(model = subtype_normo_model, subtype = subtype, model_name = "normo")
+  subtype_oligo_model.coef <- get_model_coefficients(model = subtype_oligo_model, subtype = subtype, model_name = "oligo")
+  
+  subtype_coefficients_df <- do.call(rbind, list(subtype_model.interaction.coef, 
+                                                 subtype_model.additive.coef, 
+                                                 subtype_normo_model.coef, 
+                                                 subtype_oligo_model.coef))
+
+  # ---------- ANOVA test additive vs interaction model ----------
+  anova_test <- anova(subtype_model.interaction, subtype_model.additive, test = "Chisq")
+
+  # ---------- Generate predictions from the additive regression model ----------
+  
+  ## Define predictions dataset
+  subtype_predictions <- data.table()
+  if (sperm_parameter == "avgMotil") {
+    prediction_avgMotil <- 50
+    normo_predict_data <- data.table("age" = seq(0, 70, 1), "avgMotil" = prediction_avgMotil, "fertility_status" = "Normozoospermic", "subtype_collapsed" = subtype)
+    oligo_predict_data <- data.table("age" = seq(0, 70, 1), "avgMotil" = prediction_avgMotil, "fertility_status" = "Oligozoospermic", "subtype_collapsed" = subtype)
+    predict_data <- rbind(normo_predict_data, oligo_predict_data) %>% data.table()
+
+    ## Get observed age ranges
+    normo_age_range <- model_df[fertility_status == "Normozoospermic"]$age %>% range()
+    oligo_age_range <- model_df[fertility_status == "Oligozoospermic"]$age %>% range()
+    
+    normo_observed_ages <- seq(floor(normo_age_range[1]), ceiling(normo_age_range[2]), 1)
+    oligo_observed_ages <- seq(floor(oligo_age_range[1]), ceiling(oligo_age_range[2]), 1)
+
+    ## Generate prediction
+    predictions <- predict(final_model, newdata = predict_data, type = "response", se.fit = TRUE)
+    predict_data$predicted_fraction <- predictions$fit
+    predict_data$predicted_se <- predictions$se.fit
+    
+    subtype_predictions <- predict_data %>%
+      mutate(observed = ifelse((fertility_status == "Normozoospermic" & age %in% normo_observed_ages) | 
+                                (fertility_status == "Oligozoospermic" & age %in% oligo_observed_ages), 
+                                yes = "Observed", no = "Not Observed")) %>%
+      data.table()
+  }
+  
+                                         
+  return(list("subtype_interaction_model" = subtype_model.interaction, 
+              "subtype_additive_model" = subtype_model.additive, 
+              "subtype_normo_model" = subtype_normo_model, 
+              "subtype_oligo_model" = subtype_oligo_model, 
+              "subtype_coefficients_df" = subtype_coefficients_df, 
+              "subtype_predictions_df" = subtype_predictions, 
+              "anova_test" = anova_test, 
+              "final_model" = final_model))
+}
+```
+## Set up mutation spectra dataset
+```{r, message=FALSE}
+mutation_spectra_df <- mutations_filtered %>%
+  filter(sample %in% main_samples) %>%
+  left_join(., main_samples_metadata[,c("sample", "avgMotil", "sperm_concentration", "avgTMC", "avgTotSperm", "avgProgMotil", "avgVital")]) %>%
+  group_by(donor_id, tissue, age, timepoint, cohort, fertility_status, sperm_concentration, avgMotil) %>%
+  mutate(total_n_var = n_distinct(var_coord)) %>%
+  group_by(donor_id, tissue, age, timepoint, cohort, fertility_status, avgMotil, total_n_var, subtype_collapsed) %>%
+  summarise(n_var_subtype = n_distinct(var_coord)) %>%
+  mutate(fraction = n_var_subtype / total_n_var) %>%
+  mutate(is_oligo_outlier = ifelse(donor_id %in% c("ZM3K", "H4XT", "5VW6") & tissue == "Blood_DNA", yes = "Outlier", no = "Non-Outlier")) %>%
+  data.table()
+
+subtypes <- unique(mutation_spectra_df$subtype_collapsed)  
+```
+## Go through each subtype and perform binomial regression {.tabset}
+```{r, message=FALSE}
+## Sperm regressions
+C_A_sperm <- get_subtype_regression(mutation_spectra_df[tissue == "Sperm_DNA" & subtype_collapsed == "C>A"], subtype = "C>A", tissue = "Sperm_DNA")
+summary(C_A_sperm$subtype_additive_model)
+summary(C_A_sperm$subtype_interaction_model)
+print(C_A_sperm$anova_test)
+
+C_G_sperm <- get_subtype_regression(mutation_spectra_df[tissue == "Sperm_DNA" & subtype_collapsed == "C>G"], subtype = "C>G", tissue = "Sperm_DNA")
+summary(C_G_sperm$subtype_additive_model)
+summary(C_G_sperm$subtype_interaction_model)
+print(C_G_sperm$anova_test)
+
+C_T_sperm <- get_subtype_regression(mutation_spectra_df[tissue == "Sperm_DNA" & subtype_collapsed == "C>T"], subtype = "C>T", tissue = "Sperm_DNA")
+summary(C_T_sperm$subtype_additive_model)
+summary(C_T_sperm$subtype_interaction_model)
+print(C_T_sperm$anova_test)
+
+CpG_TpG_sperm <- get_subtype_regression(mutation_spectra_df[tissue == "Sperm_DNA" & subtype_collapsed == "CpG>TpG"], subtype = "CpG>TpG", tissue = "Sperm_DNA")
+summary(CpG_TpG_sperm$subtype_additive_model)
+summary(CpG_TpG_sperm$subtype_interaction_model)
+print(CpG_TpG_sperm$anova_test)
+
+T_A_sperm <- get_subtype_regression(mutation_spectra_df[tissue == "Sperm_DNA" & subtype_collapsed == "T>A"], subtype = "T>A", tissue = "Sperm_DNA")
+summary(T_A_sperm$subtype_additive_model)
+summary(T_A_sperm$subtype_interaction_model)
+print(T_A_sperm$anova_test)
+
+T_C_sperm <- get_subtype_regression(mutation_spectra_df[tissue == "Sperm_DNA" & subtype_collapsed == "T>C"], subtype = "T>C", tissue = "Sperm_DNA")
+summary(T_C_sperm$subtype_additive_model)
+summary(T_C_sperm$subtype_interaction_model)
+print(T_C_sperm$anova_test)
+
+T_G_sperm <- get_subtype_regression(mutation_spectra_df[tissue == "Sperm_DNA" & subtype_collapsed == "T>G"], subtype = "T>G", tissue = "Sperm_DNA")
+summary(T_G_sperm$subtype_additive_model)
+summary(T_G_sperm$subtype_interaction_model)
+print(T_G_sperm$anova_test)
+
+## Blood regressions
+C_A_blood <- get_subtype_regression(mutation_spectra_df[tissue == "Blood_DNA" & subtype_collapsed == "C>A"], subtype = "C>A", tissue = "Blood_DNA")
+C_G_blood <- get_subtype_regression(mutation_spectra_df[tissue == "Blood_DNA" & subtype_collapsed == "C>G"], subtype = "C>G", tissue = "Blood_DNA")
+C_T_blood <- get_subtype_regression(mutation_spectra_df[tissue == "Blood_DNA" & subtype_collapsed == "C>T"], subtype = "C>T", tissue = "Blood_DNA")
+CpG_TpG_blood <- get_subtype_regression(mutation_spectra_df[tissue == "Blood_DNA" & subtype_collapsed == "CpG>TpG"], subtype = "CpG>TpG", tissue = "Blood_DNA")
+summary(CpG_TpG_blood$subtype_additive_model)
+summary(CpG_TpG_blood$subtype_interaction_model)
+print(CpG_TpG_blood$anova_test)
+
+T_A_blood <- get_subtype_regression(mutation_spectra_df[tissue == "Blood_DNA" & subtype_collapsed == "T>A"], subtype = "T>A", tissue = "Blood_DNA")
+T_C_blood <- get_subtype_regression(mutation_spectra_df[tissue == "Blood_DNA" & subtype_collapsed == "T>C"], subtype = "T>C", tissue = "Blood_DNA")
+T_G_blood <- get_subtype_regression(mutation_spectra_df[tissue == "Blood_DNA" & subtype_collapsed == "T>G"], subtype = "T>G", tissue = "Blood_DNA")
+```
+### Compare additive and interaction models Sperm DNA
+```{r, message=FALSE}
+sperm_anova_tests <- list(
+  "C>A" = C_A_sperm$anova_test, 
+  "C>G" = C_G_sperm$anova_test, 
+  "C>T" = C_T_sperm$anova_test, 
+  "CpG>TpG" = CpG_TpG_sperm$anova_test, 
+  "T>A" = T_A_sperm$anova_test, 
+  "T>C" = T_C_sperm$anova_test, 
+  "T>G" = T_G_sperm$anova_test
+)
+
+for (subtype in subtypes) {
+  print(paste0("Subtype: ", subtype))
+  print(sperm_anova_tests[[subtype]])
+} 
+```
+### Compare additive and interaction models Blood DNA
+```{r, message=FALSE}
+blood_anova_tests <- list(
+  "C>A" = C_A_blood$anova_test,
+  "C>G" = C_G_blood$anova_test,
+  "C>T" = C_T_blood$anova_test,
+  "CpG>TpG" = CpG_TpG_blood$anova_test,
+  "T>A" = T_A_blood$anova_test,
+  "T>C" = T_C_blood$anova_test,
+  "T>G" = T_G_blood$anova_test
+)
+
+for (subtype in subtypes) {
+  print(paste0("Subtype: ", subtype))
+  print(blood_anova_tests[[subtype]])
+}
+```
+### Identify significant coefficients in Sperm DNA
+```{r, message=FALSE}
+sperm_combined_coefficients <- do.call(rbind, list(
+                                             C_A_sperm$subtype_coefficients_df, 
+                                             C_G_sperm$subtype_coefficients_df, 
+                                             C_T_sperm$subtype_coefficients_df,
+                                             CpG_TpG_sperm$subtype_coefficients_df,
+                                             T_A_sperm$subtype_coefficients_df,
+                                             T_C_sperm$subtype_coefficients_df,
+                                             T_G_sperm$subtype_coefficients_df)) %>%
+  filter(term != "(Intercept)")
+sperm_combined_coefficients$adjusted_p_vlaue <- p.adjust(sperm_combined_coefficients$p_value, method = "BH")
+sperm_combined_coefficients[adjusted_p_vlaue < 0.05]
+```
+### Identify significant coefficients in Blood DNA
+```{r, message=FALSE}
+blood_combined_coefficients <- do.call(rbind, list(
+                                             C_A_blood$subtype_coefficients_df, 
+                                             C_G_blood$subtype_coefficients_df, 
+                                             C_T_blood$subtype_coefficients_df,
+                                             CpG_TpG_blood$subtype_coefficients_df,
+                                             T_A_blood$subtype_coefficients_df,
+                                             T_C_blood$subtype_coefficients_df,
+                                             T_G_blood$subtype_coefficients_df)) %>%
+  filter(term != "(Intercept)")
+blood_combined_coefficients$adjusted_p_vlaue <- p.adjust(blood_combined_coefficients$p_value, method = "BH")
+blood_combined_coefficients[adjusted_p_vlaue < 0.05]
+```
+## Generate plots {.tabset}
+### Sperm DNA
+```{r, message=FALSE}
+sperm_combined_predictions <- do.call(rbind, list(C_A_sperm$subtype_predictions_df, 
+                                                  C_G_sperm$subtype_predictions_df, 
+                                                  C_T_sperm$subtype_predictions_df,
+                                                  CpG_TpG_sperm$subtype_predictions_df,
+                                                  T_A_sperm$subtype_predictions_df,
+                                                  T_C_sperm$subtype_predictions_df,
+                                                  T_G_sperm$subtype_predictions_df)) %>%
+  mutate(tissue_label = "Sperm")
+
+blood_combined_predictions <- do.call(rbind, list(C_A_blood$subtype_predictions_df, 
+                                                  C_G_blood$subtype_predictions_df, 
+                                                  C_T_blood$subtype_predictions_df,
+                                                  CpG_TpG_blood$subtype_predictions_df,
+                                                  T_A_blood$subtype_predictions_df,
+                                                  T_C_blood$subtype_predictions_df,
+                                                  T_G_blood$subtype_predictions_df)) %>%
+  mutate(tissue_label = "Blood")
+
+
+
+combined_predictions <- rbind(sperm_combined_predictions, blood_combined_predictions)
+
+## Estimate se intervals
+combined_predictions$upper_predicted_fraction <- combined_predictions$predicted_fraction + 1.96 * combined_predictions$predicted_se
+combined_predictions$lower_predicted_fraction <- combined_predictions$predicted_fraction - 1.96 * combined_predictions$predicted_se
+combined_predictions$lower_predicted_fraction <- ifelse(combined_predictions$lower_predicted_fraction < 0, 0, combined_predictions$lower_predicted_fraction)
+
+mutation_spectra_df$tissue_label <- ifelse(mutation_spectra_df$tissue == "Sperm_DNA", "Sperm", "Blood")
+mutation_spectra_df$tissue_label <- factor(mutation_spectra_df$tissue_label, levels = c("Sperm", "Blood"))
+combined_predictions$tissue_label <- factor(combined_predictions$tissue_label, levels = c("Sperm", "Blood"))
+
+sperm_spectra <- mutation_spectra_df[tissue == "Sperm_DNA"]
+sperm_predictions <- combined_predictions[tissue_label == "Sperm"]
+
+subtype_plot <- ggplot(sperm_spectra) + 
+  geom_point(aes(x = age, y = fraction, color = fertility_status)) + 
+  geom_line(data = sperm_predictions[observed == "Observed"], 
+            aes(x = age, y = predicted_fraction, color = fertility_status)) +
+  geom_ribbon(data = sperm_predictions[observed == "Observed"], 
+              aes(x = age, ymin = lower_predicted_fraction, ymax = upper_predicted_fraction, fill = fertility_status), 
+              alpha = 0.1, show.legend = FALSE) +     
+  theme_bw() + 
+  facet_grid(tissue_label ~ subtype_collapsed) + 
+  scale_color_manual(values = c("Normozoospermic" = "#67A9CF", "Oligozoospermic" = "#EF8A62")) + 
+  scale_fill_manual(values = c("Normozoospermic" = "#67A9CF", "Oligozoospermic" = "#EF8A62")) + 
+  guides(color = guide_legend(title = "Fertility Status")) + 
+  scale_x_continuous(limits = c(20, 70), breaks = seq(20, 70, 10)) + 
+  scale_y_continuous(limits = c(0, .80), breaks = seq(0, .80, 0.2)) +
+  theme(strip.text = element_text(color = "black", size = 12), 
+        strip.background = element_rect(color = "black", fill = NA), 
+        legend.position = "top", 
+        panel.grid.minor = element_blank(),
+        axis.title.x = element_blank(),
+        axis.ticks.x = element_line(color = "black"),
+        axis.text.x = element_text(color = "black", size = 12),
+        axis.title.y = element_text(color = "black", size = 14),
+        axis.ticks.y = element_line(color = "black"),
+        axis.text.y = element_text(color = "black", size = 12), 
+        legend.text = element_text(color = "black", size = 12), 
+        legend.title = element_text(color = "black", size = 14)) +
+  xlab("Age") + 
+  ylab("Fraction")
+print(subtype_plot)       
+ggsave(paste0(supplementary_figure_dir, "/mutation spectra plot.pdf"), plot = subtype_plot, width = 13, height = 5)
+```
+
+# Supplementary Figure - Examine mutation spectra in oligo blood outliers
+```{r, message=FALSE}
+final_coefficients <- data.table()
+oligo_df <- mutation_spectra_df[tissue == "Blood_DNA" & fertility_status == "Oligozoospermic"]
+for (subtype in subtypes) {
+  oligo_subtype_df <- oligo_df[subtype_collapsed == subtype]
+  print(subtype)
+  subtype_model <- glm(fraction ~ age + is_oligo_outlier, 
+                       data = oligo_subtype_df, 
+                       family = binomial(link = "logit"), 
+                       weights = oligo_subtype_df$total_n_var)
+
+  if (subtype == "CpG>TpG") {
+    predict_model <- subtype_model
+  }
+  res <- summary(subtype_model)$coefficients  
+  coefficients <- res %>% data.table()
+  colnames(coefficients) <- c("Estimate", "std_error", "z_value", "p_value")
+  coefficients$term <- rownames(res)
+  coefficients$subtype <- subtype
+  final_coefficients <- rbind(final_coefficients, coefficients)
+}
+
+final_coefficients$adjusted_p_vlaue <- p.adjust(final_coefficients$p_value, method = "BH")
+final_coefficients[adjusted_p_vlaue < 0.05]
+
+nonoutlier_predict_data <- data.table("age" = seq(0, 70, 1), is_oligo_outlier = "Non-Outlier")
+outlier_predict_data <- data.table("age" = seq(0, 70, 1), is_oligo_outlier = "Outlier")
+predict_data <- rbind(nonoutlier_predict_data, outlier_predict_data) %>% data.table()
+
+## Get observed ranges
+nonoutlier_age_range <- oligo_df[is_oligo_outlier == "Non-Outlier"]$age %>% range()
+outlier_age_range <- oligo_df[is_oligo_outlier == "Outlier"]$age %>% range()
+
+nonoutlier_observed_ages <- seq(floor(nonoutlier_age_range[1]), ceiling(nonoutlier_age_range[2]), 1)
+outlier_observed_ages <- seq(floor(outlier_age_range[1]), ceiling(outlier_age_range[2]), 1)
+
+## Generate prediction
+predictions <- predict(predict_model, newdata = predict_data, type = "response", se.fit = TRUE)
+predict_data$predicted_fraction <- predictions$fit
+predict_data$predicted_se <- predictions$se.fit
+
+predict_data <- predict_data %>%
+  mutate(observed = ifelse((is_oligo_outlier == "Non-Outlier" & age %in% nonoutlier_observed_ages) | 
+                            (is_oligo_outlier == "Outlier" & age %in% outlier_observed_ages), 
+                            yes = "Observed", no = "Not Observed"), 
+         lower_predicted_fraction = predicted_fraction - 1.96 * predicted_se, 
+         upper_predicted_fraction = predicted_fraction + 1.96 * predicted_se) %>%
+  data.table()
+
+plot_df <- mutation_spectra_df %>%
+  filter(subtype_collapsed == "CpG>TpG" & tissue == "Blood_DNA" & fertility_status == "Oligozoospermic") %>%
+  mutate(tissue_label = "Blood")
+plot_df$is_oligo_outlier <- factor(plot_df$is_oligo_outlier, levels = c("Outlier", "Non-Outlier"))
+cpgtpg_blood <- ggplot(plot_df) + 
+  geom_point(aes(x = age, y = fraction, color = is_oligo_outlier)) +
+  geom_line(data = predict_data[observed == "Observed"], 
+            aes(x = age, y = predicted_fraction, color = is_oligo_outlier)) +
+  geom_ribbon(data = predict_data[observed == "Observed"], 
+              aes(x = age, ymin = lower_predicted_fraction, ymax = upper_predicted_fraction, fill = is_oligo_outlier), 
+              alpha = 0.1, show.legend = FALSE) +     
+  theme_bw() + 
+  scale_color_manual(labels = c("Outlier" = "Yes", "Non-Outlier" = "No"), values = c("Outlier" = "red", "Non-Outlier" = "grey")) + 
+  scale_fill_manual(labels = c("Outlier" = "Yes", "Non-Outlier" = "No"), values = c("Outlier" = "red", "Non-Outlier" = "grey")) + 
+  guides(color = guide_legend(title = "Is 5VW6, ZM3K, or H4XT?")) + 
+  scale_x_continuous(limits = c(20, 70), breaks = seq(20, 70, 10)) + 
+  scale_y_continuous(limits = c(0, .80), breaks = seq(0, .80, 0.2)) +
+  theme(strip.text = element_text(color = "black", size = 12), 
+        strip.background = element_rect(color = "black", fill = NA), 
+        legend.position = "top", 
+        panel.grid.minor = element_blank(),
+        axis.title.x = element_blank(),
+        axis.ticks.x = element_line(color = "black"),
+        axis.text.x = element_text(color = "black", size = 12),
+        axis.title.y = element_text(color = "black", size = 14),
+        axis.ticks.y = element_line(color = "black"),
+        axis.text.y = element_text(color = "black", size = 12), 
+        legend.text = element_text(color = "black", size = 12), 
+        legend.title = element_text(color = "black", size = 14)) +
+  xlab("Age") + 
+  ylab("Fraction of CpG>TpG DNMs")  
+print(cpgtpg_blood)
+ggsave(paste0(supplementary_figure_dir, "/blood mutation spectra plot - CpG>TpG.pdf"), plot = cpgtpg_blood, width = 8, height = 5)
+```
+
+# Supplementary Figure - Correlate sperm and blood mutation rates
+## Get donors with matched sperm and blood
+```{r, message=FALSE}
+temp <- donor_table[,c("Donor ID", "Donor Label", "Sperm Used?", "Blood Used?")] %>% 
+  `colnames<-`(c("donor_id", "donor_label", "sperm_used", "blood_used"))
+
+matched_donor_mutations <- mutations_filtered %>%
+  left_join(., sample_metadata_complete[,c("sample", "include")], by = c("sample")) %>%
+  left_join(., temp, by = c("donor_id", "donor_label")) %>%
+  filter(include == TRUE) %>%
+  filter(sample %in% main_samples) %>%
+  group_by(donor_id, donor_label, age, timepoint, sperm_used, blood_used) %>%
+  mutate(num_tissues = n_distinct(tissue)) %>%
+  # filter(num_tissues > 1) %>%
+  left_join(., sample_coverage[probe_filter_threshold == "subset_intervals.all_filters.baseline_remove_recurrence", c("sample", "total_depth")], by = "sample") %>%
+  group_by(donor_id, donor_label, tissue, age, timepoint, sperm_used, blood_used, cohort, fertility_status, total_depth) %>%
+  summarise(n_var = n_distinct(var_coord)) %>%
+  mutate(mutation_rate = n_var / total_depth,
+         age_adjusted_mutation_rate = mutation_rate / age) %>%
+  select(donor_label, tissue, age, timepoint, sperm_used, blood_used, cohort, fertility_status, n_var, total_depth, mutation_rate, age_adjusted_mutation_rate) %>%
+  pivot_wider(names_from = tissue, values_from = c("n_var", "total_depth", "mutation_rate", "age_adjusted_mutation_rate")) %>%  
+  data.table()       
+
+write.table(matched_donor_mutations, file = paste0(table_dir, "/donor_mutation_frequency.txt"), sep = "\t", quote = FALSE, row.names = FALSE)
+
+oligo_df <- matched_donor_mutations[fertility_status == "Oligozoospermic"]
+
+jitter_pos <- position_jitter(width = 0.5, seed = 2)
+oligo_df$new_label <- ifelse(oligo_df$donor_id %in% c("5VW6", "H4XT"), oligo_df$donor_label, "")
+
+ggplot(oligo_df, aes(x = 0, y = age_adjusted_mutation_rate_Sperm_DNA)) + 
+  geom_boxplot(aes(fill = fertility_status)) + 
+  geom_point(aes(color = fertility_status), 
+             position = position_jitterdodge(seed = 2),
+             show.legend = FALSE) + 
+  theme_bw() +
+  scale_color_manual(values = c("Normozoospermic" = "#67A9CF", "Oligozoospermic" = "#EF8A62")) + 
+  scale_fill_manual(values = c("Normozoospermic" = "#a1cae1", "Oligozoospermic" = "#f6bea7")) + 
+  geom_text(aes(x = 0, fill = fertility_status, label = donor_label), position=position_jitterdodge(seed = 2), hjust = -0.8, vjust = -0.8)
+
+## Correlation in normozoospermic donors
+cor.test(matched_donor_mutations[fertility_status == "Normozoospermic"]$age_adjusted_mutation_rate_Sperm_DNA,
+         matched_donor_mutations[fertility_status == "Normozoospermic"]$age_adjusted_mutation_rate_Blood_DNA) 
+
+## Correlation in oligozoospermic donors                             
+cor.test(matched_donor_mutations[fertility_status == "Oligozoospermic"]$age_adjusted_mutation_rate_Sperm_DNA, 
+         matched_donor_mutations[fertility_status == "Oligozoospermic"]$age_adjusted_mutation_rate_Blood_DNA)     
+```
+
+
+# Supplementary Figure - Mutation signature ~ age + fertility status + semen parameters {.tabset}
+```{r, message=FALSE}
+ggplot(main_samples_mutation_signatures, aes(x = age, y = exposure_mean, color = fertility_status)) + 
+  geom_point() + 
+  geom_smooth(method = "lm", se = FALSE) +
+  facet_grid(tissue~cosmic_signature)
+```
+
+# Supplementary Figure - Mutation frequency ~ age + fertility status + semen parameters
+```{r, message=FALSE}
+sperm_mr_df <- mutations_filtered %>%
+  left_join(., sample_metadata_complete[,c("sample", "include")], by = c("sample")) %>%
+  filter(include == TRUE) %>%
+  filter(tissue == "Sperm_DNA" & sample %in% main_samples) %>%
+  group_by(donor_id, sample, age, timepoint, cohort, fertility_status) %>%
+  summarise(n_var = n_distinct(var_coord)) %>%
+  left_join(., sample_coverage[probe_filter_threshold == "subset_intervals.all_filters.baseline_remove_recurrence", c("sample", "total_depth")], by = "sample") %>%
+  left_join(., main_samples_metadata[,c("sample", "avgMotil", "sperm_concentration", "avgTMC", "avgTotSperm", "avgProgMotil", "avgVital")], by = "sample") %>%
+  mutate(mutation_rate = n_var / total_depth,
+         age_adjusted_mutation_rate = mutation_rate / age) %>%
+  data.table()
+
+oligo_mr_df <- sperm_mr_df[fertility_status == "Oligozoospermic"]
+normo_mr_df <- sperm_mr_df[fertility_status == "Normozoospermic"]
+
+MASS:: glm.nb(n_var ~ age + avgVital + offset(log(total_depth)), 
+              data = oligo_mr_df, 
+              link = "log") %>% summary()  
+```
+
+# Supplementary Figure - Mutation spectra ~ age + fertility status + semen parameters {.tabset}
+## Average motil %
+```{r, message=FALSE}
+sperm_mutation_spectra <- mutations_filtered %>%
+  left_join(., sample_metadata_complete[,c("sample", "include")], by = c("sample")) %>%
+  filter(include == TRUE) %>%
+  filter(tissue == "Sperm_DNA" & sample %in% main_samples) %>%
+  left_join(., main_samples_metadata[,c("sample", "avgMotil", "sperm_concentration", "avgTMC", "avgTotSperm", "avgProgMotil", "avgVital")], by = "sample") %>%
+  group_by(donor_id, sample, tissue, age, timepoint, cohort, fertility_status, sperm_concentration, avgMotil, avgTMC, avgTotSperm, avgProgMotil, avgVital) %>%
+  mutate(total_n_var = n_distinct(var_coord)) %>%
+  group_by(donor_id, tissue, age, timepoint, cohort, fertility_status, sperm_concentration, avgMotil, avgTMC, avgTotSperm, avgProgMotil, avgVital,
+           total_n_var, subtype_collapsed) %>%
+  summarise(n_var_subtype = n_distinct(var_coord)) %>%
+  mutate(fraction = n_var_subtype / total_n_var) %>%
+  mutate(is_oligo_outlier = ifelse(donor_id %in% c("ZM3K", "H4XT", "5VW6") & tissue == "Blood_DNA", yes = "Outlier", no = "Non-Outlier")) %>%
+  data.table()  
+
+C_A <- get_subtype_regression(model_df = sperm_mutation_spectra, subtype = "C>A", tissue = "Sperm_DNA", sperm_parameter = "avgMotil")  
+C_G <- get_subtype_regression(sperm_mutation_spectra, subtype = "C>G", tissue = "Sperm_DNA", sperm_parameter = "avgMotil")
+C_T <- get_subtype_regression(sperm_mutation_spectra, subtype = "C>T", tissue = "Sperm_DNA", sperm_parameter = "avgMotil")
+CpG_TpG <- get_subtype_regression(sperm_mutation_spectra, subtype = "CpG>TpG", tissue = "Sperm_DNA", sperm_parameter = "avgMotil")
+T_A <- get_subtype_regression(sperm_mutation_spectra, subtype = "T>A", tissue = "Sperm_DNA", sperm_parameter = "avgMotil")
+T_C <- get_subtype_regression(sperm_mutation_spectra, subtype = "T>C", tissue = "Sperm_DNA", sperm_parameter = "avgMotil")
+T_G <- get_subtype_regression(sperm_mutation_spectra, subtype = "T>G", tissue = "Sperm_DNA", sperm_parameter = "avgMotil")
+
+avgMotil_combined_predictions <- do.call(rbind, list(C_A$subtype_coefficients_df, 
+                                                      C_G$subtype_coefficients_df, 
+                                                      C_T$subtype_coefficients_df,
+                                                      CpG_TpG$subtype_coefficients_df,
+                                                      T_A$subtype_coefficients_df,
+                                                      T_C$subtype_coefficients_df,
+                                                      T_G$subtype_coefficients_df)) %>%
+  filter(term != "(Intercept)")                                                      
+avgMotil_combined_predictions$adjusted_p_vlaue <- p.adjust(avgMotil_combined_predictions$p_value, method = "BH")                                                      
+avgMotil_combined_predictions[adjusted_p_vlaue < 0.05]
+```
+
+## Sperm concentration
+```{r, message=FALSE}
+C_A <- get_subtype_regression(model_df = sperm_mutation_spectra[subtype_collapsed == "C>A"], 
+                              subtype = "C>A", tissue = "Sperm_DNA", sperm_parameter = "sperm_concentration")
+C_G <- get_subtype_regression(model_df = sperm_mutation_spectra[subtype_collapsed == "C>G"], 
+                              subtype = "C>G", tissue = "Sperm_DNA", sperm_parameter = "sperm_concentration")
+C_T <- get_subtype_regression(model_df = sperm_mutation_spectra[subtype_collapsed == "C>T"],
+                              subtype = "C>T", tissue = "Sperm_DNA", sperm_parameter = "sperm_concentration")
+CpG_TpG <- get_subtype_regression(model_df = sperm_mutation_spectra[subtype_collapsed == "CpG>TpG"], 
+                                  subtype = "CpG>TpG", tissue = "Sperm_DNA", sperm_parameter = "sperm_concentration")
+T_A <- get_subtype_regression(model_df = sperm_mutation_spectra[subtype_collapsed == "T>A"], 
+                              subtype = "T>A", tissue = "Sperm_DNA", sperm_parameter = "sperm_concentration")
+T_C <- get_subtype_regression(model_df = sperm_mutation_spectra[subtype_collapsed == "T>C"], 
+                              subtype = "T>C", tissue = "Sperm_DNA", sperm_parameter = "sperm_concentration")
+T_G <- get_subtype_regression(model_df = sperm_mutation_spectra[subtype_collapsed == "T>G"], 
+                              subtype = "T>G", tissue = "Sperm_DNA", sperm_parameter = "sperm_concentration")
+
+sperm_concentration_combined_predictions <- do.call(rbind, list(C_A$subtype_coefficients_df, 
+                                                                C_G$subtype_coefficients_df, 
+                                                                C_T$subtype_coefficients_df,
+                                                                CpG_TpG$subtype_coefficients_df,
+                                                                T_A$subtype_coefficients_df,
+                                                                T_C$subtype_coefficients_df,
+                                                                T_G$subtype_coefficients_df)) %>%
+  filter(term != "(Intercept)")
+sperm_concentration_combined_predictions$adjusted_p_vlaue <- p.adjust(sperm_concentration_combined_predictions$p_value, method = "BH")
+sperm_concentration_combined_predictions[adjusted_p_vlaue < 0.05]
+
+ggplot(sperm_mutation_spectra, aes(x = sperm_concentration, y = fraction / age, color = fertility_status)) + geom_point() + facet_wrap(~subtype_collapsed)
+```
+
+## Average TMC
+```{r, message=FALSE}
+C_A <- get_subtype_regression(model_df = sperm_mutation_spectra[subtype_collapsed == "C>A"], 
+                              subtype = "C>A", tissue = "Sperm_DNA", sperm_parameter = "avgTMC")
+C_G <- get_subtype_regression(model_df = sperm_mutation_spectra[subtype_collapsed == "C>G"],
+                              subtype = "C>G", tissue = "Sperm_DNA", sperm_parameter = "avgTMC")
+C_T <- get_subtype_regression(model_df = sperm_mutation_spectra[subtype_collapsed == "C>T"],
+                              subtype = "C>T", tissue = "Sperm_DNA", sperm_parameter = "avgTMC")
+CpG_TpG <- get_subtype_regression(model_df = sperm_mutation_spectra[subtype_collapsed == "CpG>TpG"], 
+                                  subtype = "CpG>TpG", tissue = "Sperm_DNA", sperm_parameter = "avgTMC")
+T_A <- get_subtype_regression(model_df = sperm_mutation_spectra[subtype_collapsed == "T>A"],
+                              subtype = "T>A", tissue = "Sperm_DNA", sperm_parameter = "avgTMC")
+T_C <- get_subtype_regression(model_df = sperm_mutation_spectra[subtype_collapsed == "T>C"],
+                              subtype = "T>C", tissue = "Sperm_DNA", sperm_parameter = "avgTMC")
+T_G <- get_subtype_regression(model_df = sperm_mutation_spectra[subtype_collapsed == "T>G"],
+                              subtype = "T>G", tissue = "Sperm_DNA", sperm_parameter = "avgTMC")
+
+avgTMC_combined_predictions <- do.call(rbind, list(C_A$subtype_coefficients_df, 
+                                                   C_G$subtype_coefficients_df, 
+                                                   C_T$subtype_coefficients_df,
+                                                   CpG_TpG$subtype_coefficients_df,
+                                                   T_A$subtype_coefficients_df,
+                                                   T_C$subtype_coefficients_df,
+                                                   T_G$subtype_coefficients_df)) %>%
+  filter(term != "(Intercept)")
+avgTMC_combined_predictions$adjusted_p_vlaue <- p.adjust(avgTMC_combined_predictions$p_value, method = "BH")
+avgTMC_combined_predictions[adjusted_p_vlaue < 0.05]
+
+ggplot(sperm_mutation_spectra, aes(x = avgTMC, y = fraction, color = fertility_status)) + geom_point() + facet_wrap(~subtype_collapsed) + geom_smooth(method = "lm")
+```
+
+## Average total sperm count
+```{r, message=FALSE}
+C_A <- get_subtype_regression(model_df = sperm_mutation_spectra[subtype_collapsed == "C>A"], 
+                              subtype = "C>A", tissue = "Sperm_DNA", sperm_parameter = "avgTotSperm")
+C_G <- get_subtype_regression(model_df = sperm_mutation_spectra[subtype_collapsed == "C>G"],
+                              subtype = "C>G", tissue = "Sperm_DNA", sperm_parameter = "avgTotSperm")
+C_T <- get_subtype_regression(model_df = sperm_mutation_spectra[subtype_collapsed == "C>T"],
+                              subtype = "C>T", tissue = "Sperm_DNA", sperm_parameter = "avgTotSperm")
+CpG_TpG <- get_subtype_regression(model_df = sperm_mutation_spectra[subtype_collapsed == "CpG>TpG"], 
+                                  subtype = "CpG>TpG", tissue = "Sperm_DNA", sperm_parameter = "avgTotSperm")
+T_A <- get_subtype_regression(model_df = sperm_mutation_spectra[subtype_collapsed == "T>A"],
+                              subtype = "T>A", tissue = "Sperm_DNA", sperm_parameter = "avgTotSperm")
+T_C <- get_subtype_regression(model_df = sperm_mutation_spectra[subtype_collapsed == "T>C"],
+                              subtype = "T>C", tissue = "Sperm_DNA", sperm_parameter = "avgTotSperm")
+T_G <- get_subtype_regression(model_df = sperm_mutation_spectra[subtype_collapsed == "T>G"],
+                              subtype = "T>G", tissue = "Sperm_DNA", sperm_parameter = "avgTotSperm")
+
+avgTotSperm_combined_predictions <- do.call(rbind, list(C_A$subtype_coefficients_df, 
+                                                        C_G$subtype_coefficients_df, 
+                                                        C_T$subtype_coefficients_df,
+                                                        CpG_TpG$subtype_coefficients_df,
+                                                        T_A$subtype_coefficients_df,
+                                                        T_C$subtype_coefficients_df,
+                                                        T_G$subtype_coefficients_df)) %>%
+  filter(term != "(Intercept)")
+avgTotSperm_combined_predictions$adjusted_p_vlaue <- p.adjust(avgTotSperm_combined_predictions$p_value, method = "BH")
+avgTotSperm_combined_predictions[adjusted_p_vlaue < 0.05]
+
+ggplot(sperm_mutation_spectra, aes(x = avgTotSperm, y = fraction, color = fertility_status)) + geom_point() + facet_wrap(~subtype_collapsed) + geom_smooth(method = "lm")
+```
+
+## Average progressive motility
+```{r, message=FALSE}
+C_A <- get_subtype_regression(model_df = sperm_mutation_spectra[subtype_collapsed == "C>A"], 
+                              subtype = "C>A", tissue = "Sperm_DNA", sperm_parameter = "avgProgMotil")
+C_G <- get_subtype_regression(model_df = sperm_mutation_spectra[subtype_collapsed == "C>G"],
+                              subtype = "C>G", tissue = "Sperm_DNA", sperm_parameter = "avgProgMotil")
+C_T <- get_subtype_regression(model_df = sperm_mutation_spectra[subtype_collapsed == "C>T"],
+                              subtype = "C>T", tissue = "Sperm_DNA", sperm_parameter = "avgProgMotil")
+CpG_TpG <- get_subtype_regression(model_df = sperm_mutation_spectra[subtype_collapsed == "CpG>TpG"], 
+                                  subtype = "CpG>TpG", tissue = "Sperm_DNA", sperm_parameter = "avgProgMotil")
+T_A <- get_subtype_regression(model_df = sperm_mutation_spectra[subtype_collapsed == "T>A"],
+                              subtype = "T>A", tissue = "Sperm_DNA", sperm_parameter = "avgProgMotil")
+T_C <- get_subtype_regression(model_df = sperm_mutation_spectra[subtype_collapsed == "T>C"],
+                              subtype = "T>C", tissue = "Sperm_DNA", sperm_parameter = "avgProgMotil")
+T_G <- get_subtype_regression(model_df = sperm_mutation_spectra[subtype_collapsed == "T>G"],
+                              subtype = "T>G", tissue = "Sperm_DNA", sperm_parameter = "avgProgMotil")
+
+avgProgMotil_combined_predictions <- do.call(rbind, list(C_A$subtype_coefficients_df, 
+                                                         C_G$subtype_coefficients_df, 
+                                                         C_T$subtype_coefficients_df,
+                                                         CpG_TpG$subtype_coefficients_df,
+                                                         T_A$subtype_coefficients_df,
+                                                         T_C$subtype_coefficients_df,
+                                                         T_G$subtype_coefficients_df)) %>%
+  filter(term != "(Intercept)")
+avgProgMotil_combined_predictions$adjusted_p_vlaue <- p.adjust(avgProgMotil_combined_predictions$p_value, method = "BH")
+avgProgMotil_combined_predictions[adjusted_p_vlaue < 0.05]
+
+ggplot(sperm_mutation_spectra, aes(x = avgProgMotil, y = fraction, color = fertility_status)) + geom_point() + facet_wrap(~subtype_collapsed) + geom_smooth(method = "lm")
+```
+
+## Average vitality
+```{r, message=FALSE}
+C_A <- get_subtype_regression(model_df = sperm_mutation_spectra[subtype_collapsed == "C>A"], 
+                              subtype = "C>A", tissue = "Sperm_DNA", sperm_parameter = "avgVital")
+C_G <- get_subtype_regression(model_df = sperm_mutation_spectra[subtype_collapsed == "C>G"],
+                              subtype = "C>G", tissue = "Sperm_DNA", sperm_parameter = "avgVital")
+C_T <- get_subtype_regression(model_df = sperm_mutation_spectra[subtype_collapsed == "C>T"],
+                              subtype = "C>T", tissue = "Sperm_DNA", sperm_parameter = "avgVital")
+CpG_TpG <- get_subtype_regression(model_df = sperm_mutation_spectra[subtype_collapsed == "CpG>TpG"], 
+                                  subtype = "CpG>TpG", tissue = "Sperm_DNA", sperm_parameter = "avgVital")
+T_A <- get_subtype_regression(model_df = sperm_mutation_spectra[subtype_collapsed == "T>A"],
+                              subtype = "T>A", tissue = "Sperm_DNA", sperm_parameter = "avgVital")
+T_C <- get_subtype_regression(model_df = sperm_mutation_spectra[subtype_collapsed == "T>C"],
+                              subtype = "T>C", tissue = "Sperm_DNA", sperm_parameter = "avgVital")
+T_G <- get_subtype_regression(model_df = sperm_mutation_spectra[subtype_collapsed == "T>G"],
+                              subtype = "T>G", tissue = "Sperm_DNA", sperm_parameter = "avgVital")
+
+avgVital_combined_predictions <- do.call(rbind, list(C_A$subtype_coefficients_df, 
+                                                     C_G$subtype_coefficients_df, 
+                                                     C_T$subtype_coefficients_df,
+                                                     CpG_TpG$subtype_coefficients_df,
+                                                     T_A$subtype_coefficients_df,
+                                                     T_C$subtype_coefficients_df,
+                                                     T_G$subtype_coefficients_df)) %>%
+  filter(term != "(Intercept)")
+avgVital_combined_predictions$adjusted_p_vlaue <- p.adjust(avgVital_combined_predictions$p_value, method = "BH")
+avgVital_combined_predictions[adjusted_p_vlaue < 0.05]
+
+ggplot(sperm_mutation_spectra, aes(x = avgVital, y = fraction, color = fertility_status)) + geom_point() + facet_wrap(~subtype_collapsed) + geom_smooth(method = "lm")
+```
+
+

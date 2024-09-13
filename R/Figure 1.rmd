@@ -1,0 +1,152 @@
+---
+title: "Figure 1"
+author: ""
+date: ""
+output: 
+  html_document:
+    fig_height: 3
+    fig_width: 5
+  pdf_document:
+    fig_height: 3
+    fig_width: 5
+  word_document:
+    fig_height: 3
+    fig_width: 5
+---
+
+```{r, setup, message=FALSE, warning=FALSE}
+## Load in datasets
+source("/scratch/ucgd/lustre-labs/quinlan/u1240855/normo-vs-oligo/R/normo-vs-oligo-data-setup.r")
+setup_list <- setup_data()
+
+donor_table <- setup_list$donor_table
+main_figure_dir <- setup_list$main_figure_dir
+```
+
+# Figure 1: Sperm concentration
+Create figure 1 using the donor table dataset (Table 1 in the manuscript). 
+
+## Dataset setup
+```{r, message=FALSE}
+sperm_df <- donor_table %>% 
+  mutate(fertility_status = Cohort, 
+         cohort = `Sub-cohort`, 
+         donor_id = `Donor ID`, 
+         sperm_concentration = `Sperm Concentration (million/mL)`) %>%
+  mutate(fertility_status = ifelse(fertility_status == "Normo.", 
+                                   yes = "Normozoospermic", 
+                                   no = "Oligozoospermic")) %>%        
+  select(donor_id, fertility_status, cohort, sperm_concentration) %>%                                
+  data.table()                                   
+
+cross_sectional_df <- sperm_df[cohort == "Cross."]
+cross_sectional_df$timepoint <- "timepoint1"
+cross_sectional_df$cohort <- "Cross-sectional"
+
+sperm_concentration_df <- sperm_df[cohort == "Long."] %>%
+  mutate(cohort = "Longitudinal") %>%
+  separate_wider_delim(sperm_concentration, "; ", names = c("timepoint1", "timepoint2")) %>%
+  pivot_longer(cols = c("timepoint1", "timepoint2"), names_to = "timepoint", values_to = "sperm_concentration") %>%
+  select(donor_id, fertility_status, cohort, sperm_concentration, timepoint) %>%
+  rbind(., cross_sectional_df) %>%
+  mutate(final_fertility_status = ifelse(fertility_status == "Normozoospermic", 
+                                         yes = ifelse(cohort == "Cross-sectional", 
+                                                      yes = "Fertile\nCross\nSectional", 
+                                                      no = "Fertile\nlongitudinal"), 
+                                         no = "Subfertile\nCross\nSectional")) %>%
+  mutate(final_fertility_status = ifelse(cohort == "Longitudinal",
+                                         yes = ifelse(timepoint == "timepoint1", 
+                                                      yes = "Fertile\nLongitudinal\n(TP1)",
+                                                      no = "Fertile\nLongitudinal\n(TP2)"), 
+                                         no = final_fertility_status)) %>%
+  data.table()     
+
+sperm_concentration_df$sperm_concentration <- as.numeric(sperm_concentration_df$sperm_concentration)                                    
+```
+
+## Main plot
+```{r, message=FALSE}
+sperm_concentration_df$final_fertility_status <- factor(sperm_concentration_df$final_fertility_status, 
+                                                        levels = c("Fertile\nLongitudinal\n(TP1)",
+                                                                  "Fertile\nLongitudinal\n(TP2)",
+                                                                  "Fertile\nCross\nSectional",
+                                                                  "Subfertile\nCross\nSectional"))
+sperm_concentration_df$donor_label <- ifelse(sperm_concentration_df$cohort == "Longitudinal", yes = as.character(sperm_concentration_df$donor_id), no = "")                                                     
+main_plot <- ggplot(sperm_concentration_df, aes(x = final_fertility_status, y = sperm_concentration, label = donor_label)) +
+  geom_hline(yintercept = 15, linetype = "dashed", color = "black", linewidth = 0.5) +
+  stat_summary(aes(color = fertility_status), 
+               fun = mean, fun.min = mean, fun.max = mean,
+               geom = "crossbar", width = 0.75, linewidth = 0.2, show.legend = FALSE) + 
+  geom_point(aes(color = fertility_status, shape = final_fertility_status),
+             position = position_jitterdodge(seed = 24, jitter.width = 2), size = 3) +
+  theme_bw() +
+  xlab("Cohort") +
+  ylab("Sperm concentration (million/mL)") +
+  scale_y_continuous(limits = c(0, 230), breaks = c(seq(0, 230, 50), 15)) +
+  scale_color_manual(values =  c("Normozoospermic" = "#67A9CF",
+                                 "Oligozoospermic" = "#EF8A62")) +
+  scale_shape_manual(values = c("Fertile\nCross\nSectional" = 16,
+                                "Fertile\nLongitudinal\n(TP1)" = 17,
+                                "Fertile\nLongitudinal\n(TP2)" = 17,
+                                "Subfertile\nCross\nSectional" = 16)) + 
+  scale_x_discrete(labels=c("Fertile\nCross\nSectional" = "Cross\nSectional",
+                            "Fertile\nLongitudinal\n(TP1)" = "Longitudinal\n(TP1)",
+                            "Fertile\nLongitudinal\n(TP2)" = "Longitudinal\n(TP2)",
+                            "Subfertile\nCross\nSectional" = "Cross\nSectional")) +
+  facet_grid(.~fertility_status, scales = "free_x", space = "free_x", switch = "x") +
+  geom_label_repel(box.padding = 0.5, point.padding = 0.5, 
+                   segment.size = NA, 
+                   position = position_jitter(seed = 24),
+                   size = 3, show.legend = FALSE, 
+                   max.overlaps = Inf,
+                   color = "#67A9CF") +
+  theme(legend.position = "none",
+        axis.text.x = element_text(size = 12, color = "black"),
+        axis.ticks.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_text(size = 14, color = "black"),
+        axis.text.y = element_text(size = 12, color = "black"),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.spacing = unit(0, "lines"),
+        strip.placement = "outside",
+        strip.background.x = element_blank(),
+        strip.text.x = element_text(size = 14, color = "black"))
+```
+
+## Oligo zoomed plot
+```{r, message=FALSE}
+oligo_plot <- sperm_concentration_df[fertility_status == "Oligozoospermic"] %>%
+  ggplot(., aes(x = final_fertility_status, y = sperm_concentration)) +
+  geom_point(aes(color = fertility_status, shape = final_fertility_status),
+              position = position_jitterdodge(seed = 2824, jitter.width = 1), size = 3, stroke=1) +
+  stat_summary(aes(color = fertility_status),
+                fun = mean, fun.min = mean, fun.max = mean,
+                geom = "crossbar", width = 1, linewidth = 0.2, show.legend = FALSE) +
+  theme_bw() +
+  scale_y_continuous(limits = c(0, 15), breaks = seq(0, 15, 5)) +
+  scale_color_manual(values =  c("#EF8A62")) +
+  scale_shape_manual(values = c("Fertile\nCross\nSectional" = 16,
+                                "Fertile\nLongitudinal\n(TP1)" = 17,
+                                "Fertile\nLongitudinal\n(TP2)" = 17,
+                                "Subfertile\nCross\nSectional" = 16)) + 
+  theme(legend.position = "none",
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.y = element_text(size = 12, color = "black"),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank())
+
+```
+
+## Combine plots
+```{r, message=FALSE}
+oligo_plot_final <- plot_grid(NULL, oligo_plot, NULL, rel_heights = c(0.05, 0.8, 0.2), ncol = 1, nrow = 3)
+fig1 <- plot_grid(main_plot, oligo_plot_final, ncol = 2, nrow = 1, rel_widths = c(0.87, 0.13))
+
+file <- paste0(main_figure_dir, "/Figure 1.pdf")
+ggsave(filename = file, plot = fig1, width = 8, height = 4)
+print(fig1)
+```
