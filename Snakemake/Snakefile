@@ -1,0 +1,815 @@
+"""
+## Load modules
+module use $HOME/MyModules
+module load miniconda3/latest
+
+module load bcftools/1.6 
+module load bedtools
+module load vep/104.2
+
+## If VEP failes, run this: 
+unset PERL5LIB
+
+## Run in snakemake directory
+cd /scratch/ucgd/lustre-labs/quinlan/u1240855/fastq_to_duplex_bam/workflow_process_duplex_bam
+
+## Test locally (add --unlock if the directory gets locked by snakemake)
+snakemake --configfile=process_duplex_bam_config.yaml --cores 1 --rerun-incomplete
+snakemake --configfile=process_duplex_bam_config.yaml --cores 1 --rerun-incomplete --dry-run
+snakemake --configfile=process_duplex_bam_config.yaml --cores 1 --rerun-incomplete --unlock
+
+## Run on the cluster 
+nohup snakemake --profile profiles/cluster --configfile=process_duplex_bam_config.yaml --dry-run > nohup.log 2>&1 &
+snakemake --profile profiles/cluster --configfile=process_duplex_bam_config.yaml --dry-run
+
+nohup snakemake --profile profiles/cluster --configfile=process_duplex_bam_config.yaml > nohup.log 2>&1 &
+snakemake --profile profiles/cluster --configfile=process_duplex_bam_config.yaml
+
+## Run downsampled bam analysis
+snakemake --profile profiles/cluster --configfile=process_downsampled_duplex_bams_config.yaml --dry-run
+snakemake --profile profiles/cluster --configfile=process_duplex_bam_config.yaml
+nohup snakemake --profile profiles/cluster --configfile=process_downsampled_duplex_bams_config.yaml > downsampled_nohup.log 2>&1 &
+"""
+
+### Fulcrum pipeline for normo and oligo datasets
+
+# ========== LIBRARIES ==========
+
+import pandas as pd
+import os
+import re
+
+# ========== INPUTS ==========
+
+experiment_metadata = config["experiment_metadata"]
+clinical_metadata = config["clinical_metadata"]
+
+ver: str = config["version"]
+fasta: str = config["fasta"]
+
+probe_bed_file: str = config["probe_bed_file"]
+pae_variant_file: str = config["pae_variant_file"]
+homopolymer_bed_file: str = config["homopolymer_bed_file"]
+clinvar_file: str = config["clinvar_file"]
+
+bam_dir: str = config["bam_dir"]
+bam_suffix: str = config["bam_suffix"]
+
+output_dir: str = config["output_dir"] + "/" + ver
+
+subdirs = config["subdirs"]
+for subdir in subdirs:
+    if not os.path.exists(f"{output_dir}/{subdir}"):
+        os.makedirs(f"{output_dir}/{subdir}")
+
+# ========== CHECKS ==========
+
+def check_file(path): 
+    if path is None or not os.path.exists(path):
+        raise Exception(f"File/path for {path} not found. Check the file/path.")
+
+# Check that the experiment_metadata exists. 
+check_file(path=experiment_metadata)
+
+# Check that the clinical_metadata exists
+check_file(path=clinical_metadata)
+
+# Check that the fasta file exists
+check_file(path=fasta)
+
+# Check if the probe bed file exists
+check_file(path=probe_bed_file)
+
+# Check if the PAE variant file exists
+check_file(path=pae_variant_file)
+
+## Check if the homopolymer bed file exists
+check_file(path=homopolymer_bed_file)
+
+## Check if the clinvar file exists
+check_file(path=clinvar_file)
+
+# Check if the output directory exist 
+check_file(path=output_dir)
+
+# ========== INITIALIZE ==========
+
+experiment_df = pd.read_csv(experiment_metadata, sep="\t", header=0)
+print(experiment_df)
+# print(experiment_df)
+samples: str = experiment_df['sample'].tolist()
+
+samples = [sample for sample in samples if sample != "19610X20"]
+
+## List comprehension to remove samples that are not in the bam directory
+samples = [sample for sample in samples if os.path.exists(f"{bam_dir}/{sample}.{bam_suffix}")]
+
+#### REMOVE AFTER TESTING ####
+# samples = ["19610X1", "19610X2", "19610X5", "20070X1", "20070X2", "19610X10"]
+# samples = ["19610X1"]
+# samples = ["19959X10"]
+
+# ========== PBR Parameters ==========
+
+probes = ["all_intervals", "subset_intervals"]
+# filters = ["all_filters", "read_N_prop", "site_N_frequency", "read_position", "none_filters"]
+filters = ["all_filters", "none_filters"]
+thresholds = ["baseline"] ## Removed "strict" and "lenient"
+
+print("Version: ", ver)
+print("Samples: ", samples)
+print("Probes: ", probes)
+print("Filters: ", filters)
+print("Thresholds: ", thresholds)
+
+# ========== PIPELINE ==========
+
+wildcard_constraints: 
+    output_dir=output_dir,
+    sample="[0-9]+X[0-9]+",
+    probe="[a-z_]+",
+    applied_filter="[a-zA-Z_]+",
+    threshold="[a-z]+"
+
+rule all: 
+    input:
+        ######################################
+        ##### Sample metadata processing #####
+        ######################################
+        ## Rule: process_sample_metadata
+        expand("{output_dir}/final/sample_metadata.txt", output_dir=output_dir),
+
+        #########################################
+        ##### BAM qc processing with alfred #####
+        #########################################
+        ## Rule: run_alfred
+        expand("{output_dir}/alfred/{sample}_qc.json.gz", output_dir=output_dir, sample=samples),
+        expand("{output_dir}/alfred/{sample}_qc.tsv.gz", output_dir=output_dir, sample=samples),
+
+        ## Rule: get_median_insert_size
+        expand("{output_dir}/final/median_insert_size.tsv", output_dir=output_dir),
+
+        ##########################
+        ##### VCF processing #####
+        ##########################
+        ## Rule: run_vardict
+        expand("{output_dir}/fulcrum/{sample}.vardict.txt", output_dir=output_dir, sample=samples),
+        
+        # Rule: vardict_to_vcf
+        expand("{output_dir}/fulcrum/{sample}.vardict.vcf", output_dir=output_dir, sample=samples),
+        
+        ## Rule: vep_annotations
+        expand("{output_dir}/fulcrum/{sample}.vardict.vep.vcf.gz", output_dir=output_dir, sample=samples),
+
+        # ##############################################        
+        # ##### PROCESS HOMOPOLYMER DISTANCE FILES #####
+        # ##############################################
+
+        ## Rule: hp_bedtools_closest
+        expand("{output_dir}/exclusion_sites/hg38.homopolymers.closest_probes.bed.gz", output_dir=output_dir),
+
+        # Rule: hp_overlapping_flanks
+        expand("{output_dir}/exclusion_sites/hg38.homopolymers.overlapping_probe_flanks.bed.gz", output_dir=output_dir),
+        expand("{output_dir}/exclusion_sites/hg38.homopolymers.overlapping_probe_flanks.bed.gz.tbi", output_dir=output_dir),
+
+        ########################################################
+        ##### GET VARIANT DISTANCES TO NEAREST HOMOPOLYMER #####
+        ########################################################
+        
+        ## Rule: var_bedtools_closest
+        expand("{output_dir}/homopolymer/{sample}.var_hp_dist.bed.gz", output_dir=output_dir, sample=samples),
+        expand("{output_dir}/homopolymer/{sample}.var_hp_dist.bed.gz.tbi", output_dir=output_dir, sample=samples),
+
+        #######################################################       
+        ##### PROCESS FILES FOR PBR COVERAGE CALCULATIONS #####
+        #######################################################
+
+        ## Rule: run_fraguracy
+        expand("{output_dir}/fraguracy/fraguracy-total-errors.bed", output_dir=output_dir),
+        expand("{output_dir}/fraguracy/fraguracy-total-errors.bed.gz", output_dir=output_dir),
+        expand("{output_dir}/fraguracy/fraguracy-total-errors.bed.gz.tbi", output_dir=output_dir),
+
+        ## Rule: create_exclusion_sites
+        expand("{output_dir}/exclusion_sites/fraguracy_exclusion_sites.bed", output_dir=output_dir),
+        expand("{output_dir}/exclusion_sites/homopolymer_exclusion_sites.bed", output_dir=output_dir),
+        expand("{output_dir}/exclusion_sites/merged_exclusion_sites.bed", output_dir=output_dir),
+
+        ## Rule: subset_panel
+        expand("{output_dir}/coverage/subset_panel.bed", output_dir=output_dir),
+        
+        ## Rule: run_pbr
+        expand("{output_dir}/coverage/pbr_files/{sample}.{probe}.{applied_filter}.{threshold}.nucleotide_count.annotated.bed.gz", output_dir=output_dir, sample=samples, probe=probes, applied_filter=filters, threshold=thresholds),
+        expand("{output_dir}/coverage/pbr_files/{sample}.{probe}.{applied_filter}.{threshold}.nucleotide_count.annotated.bed.gz.tbi", output_dir=output_dir, sample=samples, probe=probes, applied_filter=filters, threshold=thresholds),
+
+        ###################
+        ##### VCFanno #####
+        ###################
+
+        ## Rule: create_vcfanno_config
+        expand("{output_dir}/fulcrum/{sample}.vcfanno_config.toml", output_dir=output_dir, sample=samples),
+
+        ## Rule: run_vcfanno
+        expand("{output_dir}/fulcrum/{sample}.vardict.annotated.vcf.gz", output_dir=output_dir, sample=samples),
+        expand("{output_dir}/fulcrum/{sample}.vardict.annotated.vcf.gz.tbi", output_dir=output_dir, sample=samples),
+
+        #########################################################################
+        #### Filter variants and annotate with read and variant information #####
+        #########################################################################
+
+        # Rule: get_variants_in_prob_intervals
+        expand("{output_dir}/fulcrum/{sample}.vardict.annotated.in_probe_intervals.vcf.gz", output_dir=output_dir, sample=samples),
+        expand("{output_dir}/fulcrum/{sample}.vardict.annotated.in_probe_intervals.vcf.gz.tbi", output_dir=output_dir, sample=samples),
+
+        # Rule: get_mnv_indel_coords
+        expand("{output_dir}/tmp/{sample}.mnv_indel_coords.txt", output_dir=output_dir, sample=samples),
+
+        # Rule: pysam_var_reads
+        expand("{output_dir}/tmp/{sample}.pysam_processed.txt", output_dir=output_dir, sample=samples),
+
+        ###########################################
+        ##### CREATE FINAL MUTATION FILES #########
+        ###########################################
+        
+        ## Rule: combine_pysam_var_reads
+        expand("{output_dir}/final/combined_mutations.txt", output_dir = output_dir), 
+
+        ## Rule: measure_recurrence
+        expand("{output_dir}/final/combined_mutations.with_recurrence.txt", output_dir=output_dir),
+
+        #######################################
+        ##### CREATE FINAL COVERAGE FILES #####
+        #######################################
+
+        ## Rule: combine_pbr
+        expand("{output_dir}/final/combined_pbr_coverage.txt", output_dir=output_dir),
+
+        # Rule: combine_pbr_intervals
+        expand("{output_dir}/final/combined_pbr_intervals.txt", output_dir=output_dir),
+
+
+        #################################
+        ##### GET PONYTAIL COVERAGE #####
+        #################################
+
+        ## Rule: get_ponytail_coverage
+        expand("{output_dir}/final/ponytail_coverage.txt", output_dir=output_dir)
+
+# ---------- SAMPLE METADATA PROCESSING ----------
+
+## Process sample metadata
+rule process_sample_metadata: 
+    input: 
+        experiment_metadata_file = experiment_metadata,
+        clinical_metadata_file = clinical_metadata
+    output: 
+        sample_metadata = "{output_dir}/final/sample_metadata.txt"
+    log:
+        "{output_dir}/logs/process_sample_metadata.log"        
+    params: 
+        samples = samples,
+        grouping_dir = "/scratch/ucgd/lustre-labs/quinlan/u1240855/fastq_to_duplex_bam/output/grouping",
+        duplex_yield_dir = "/scratch/ucgd/lustre-labs/quinlan/u1240855/fastq_to_duplex_bam/output/metrics"
+    script: 
+        "/scratch/ucgd/lustre-labs/quinlan/u1240855/fastq_to_duplex_bam/workflow_process_duplex_bam/scripts/snakemake_process_sample_metadata.py"        
+
+# ---------- RUN ALFRED ON DUPLEX BAM FILES ----------
+
+## Run alfred on duplex bam files
+rule run_alfred: 
+    input:
+        bam_file = bam_dir + "/{sample}." + bam_suffix,
+        ref = fasta
+    output: 
+        json_output="{output_dir}/alfred/{sample}_qc.json.gz",
+        tsv_output="{output_dir}/alfred/{sample}_qc.tsv.gz"
+    shell: 
+        """
+        echo "Running alfred for {wildcards.sample}..."
+        echo "BAM file: {input.bam_file}"
+        alfred qc \
+            -r {input.ref} \
+            -j {output.json_output} \
+            -o {output.tsv_output} \
+            {input.bam_file}
+        """
+
+## Get median insert size
+rule get_median_insert_sze: 
+	input:
+		alfred_file=expand("{output_dir}/alfred/{sample}_qc.tsv.gz", output_dir=output_dir, sample=samples)
+	output: 
+		median_insert_size="{output_dir}/final/median_insert_size.tsv"
+	shell: 
+		"""
+        # Get the header from the first file
+        zgrep ^ME {input.alfred_file[0]} | head -n 1 > {output.median_insert_size}
+
+        # Append the second row from all files
+        for file in {input.alfred_file}; do
+            zgrep ^ME $file | sed -n '2p' >> {output.median_insert_size}
+        done		
+		"""
+
+# ---------- GENERATE VARDICT VCF ---------- 
+
+# Run vardict 
+"""
+parameters: 
+-G --> The the reference fasta.  Should be indexed (.fai).
+-p --> Do pileup regarless the frequency
+-K --> Include Ns in the total depth calculation
+-F 0 --> The hexical to filter reads. 0 indactes do not filter reads. 
+-k 1 --> Indicate whether to perform local realignment. Default: 1 or yes
+-r 0 --> The minimum # of variance reads, default 2
+-P 0 --> The read position filter.  If the mean variants position is less that specified, it's considered false positive.  Default: 5
+-N --> The sample name to be used directly.  Will overwrite -n option
+-b --> The indexed BAM file
+-y --> Verbose mode.  Will output variant calling process.
+--nosv --> Turn off structural variant calling
+-c 1 --> The column for chromosome
+-S 2 --> The column for region start, e.g. gene start
+-E 3 --> The column for region end, e.g. gene end
+-g 4 --> The column for gene name, or segment annotation
+"""
+rule run_vardict: 
+    input: 
+        bam_file = bam_dir + "/{sample}." + bam_suffix,
+        probe_bed_file = probe_bed_file,
+        fasta = fasta
+    output: 
+        vardict_file = "{output_dir}/fulcrum/{sample}.vardict.txt"
+    log: 
+        "{output_dir}/logs/{sample}.run_vardict.log"
+    shell:
+        """
+        echo "Running VarDictJava for {wildcards.sample}..."
+        echo "BAM File: {input.bam_file}"
+        cd /scratch/ucgd/lustre-labs/quinlan/data-shared/datasets/spermseq/fulcrum/VarDictJava
+        PATH=$PATH:/scratch/ucgd/lustre-labs/quinlan/data-shared/datasets/spermseq/fulcrum/VarDictJava
+        /scratch/ucgd/lustre-labs/quinlan/data-shared/datasets/spermseq/fulcrum/VarDictJava/build/install/VarDict/bin/VarDict \
+            -G {input.fasta} \
+            -p \
+            -K \
+            -F 0 \
+            -k 1 \
+            -m 150 \
+            -r 0 \
+            -P 0 \
+            -N {wildcards.sample} \
+            -b {input.bam_file} \
+            -y \
+            -c 1 -S 2 -E 3 -g 4 {input.probe_bed_file} > {output.vardict_file}
+        """
+
+## Vardict to VCF
+"""
+parameters: 
+-A --> Indicate to output all variants at the same position.  By default, only the variant with the highest allele frequency is converted to VCF.
+-N --> The sample name to be used directly.
+-E --> If set, do not print END tag
+-f 0.0 --> The minimum allele frequency.  Default to 0.02
+-P 0 --> Whether to filter variants with pstd = 0.  Default: 1 or yes.  Set it to 0 for targeted PCR based sequencing, where pstd is expected.
+-p 0 --> The minimum mean position of variants in the read.  Default: 8.
+-d 3 --> The minimum total depth.  Default to 3, might consider lower depth if (high quality variant count)*af >= 0.5
+-Q 10.0 --> The minimum mapping quality.  Default to 10.0 for Illumina sequencing.  Variants with lower quality (<10) will be kept only if af >= 0.8
+-m 8.0 --> The maximum mean mismatches allowed.  Default: 5.25, or if a variant is supported by reads with more than 5.25 mean mismatches, it'll be considered false positive.  Mismatches don't includes indels in the alignment.
+-v 1 --> The minimum high quality variant depth.  Default to 2.  Would consider lower depth (high quality variant count)*af >= 0.5
+"""
+rule vardict_to_vcf: 
+    input: 
+        vardict_file = {rules.run_vardict.output.vardict_file}
+    output: 
+        vardict_vcf = "{output_dir}/fulcrum/{sample}.vardict.vcf"
+    log: 
+        "{output_dir}/logs/{sample}.vardict_to_vcf.log"
+    shell: 
+        """
+        echo "Converting vardict output to VCF"
+        echo "Vardict file: {input.vardict_file}"
+
+        cd /scratch/ucgd/lustre-labs/quinlan/data-shared/datasets/spermseq/fulcrum/VarDictJava
+        PATH=$PATH:/scratch/ucgd/lustre-labs/quinlan/data-shared/datasets/spermseq/fulcrum/VarDictJava
+        cat {input.vardict_file} | ./VarDict/teststrandbias.R | ./VarDict/var2vcf_valid.pl \
+            -A \
+            -N {wildcards.sample} \
+            -E \
+            -f 0.0 \
+            -v 1 \
+            -P 0 \
+            -p 1 \
+            -d 3 \
+            -Q 10.0 \
+            -m 8.0 > {output.vardict_vcf}
+        """
+
+## Add VEP annotations to vardict VCF
+rule vep_annotations: 
+    input: 
+        vcf = {rules.vardict_to_vcf.output.vardict_vcf},
+        fasta = fasta
+    output: 
+        vep_annotated_vcf = "{output_dir}/fulcrum/{sample}.vardict.vep.vcf.gz"
+    log: 
+        "{output_dir}/logs/{sample}.vep_annotations.log"       
+    resources: 
+        mem=128000        
+    shell: 
+        """
+        # module load vep/104.2
+        cd {wildcards.output_dir}/fulcrum
+        echo "Annotating VCF with VEP"
+        echo "VCF file: {input.vcf}"
+        echo "Fasta file: {input.fasta}"
+
+        buffer_size=5000
+
+        if [ "{wildcards.sample}" == "19610X20" ]; then
+            echo "Sample is 19610X20"
+            buffer_size=500
+        fi            
+
+        vep --cache --dir_cache /scratch/ucgd/lustre/common/data/vep_cache --fasta {input.fasta} \
+        --fork 10 \
+        --output_file {output.vep_annotated_vcf} \
+        --input_file {input.vcf} \
+        --max_sv_size 200000000 \
+        --everything \
+        --buffer_size $buffer_size \
+        --force_overwrite --vcf --compress_output bgzip
+
+        tabix {output.vep_annotated_vcf}
+        """
+
+# ---------- PROCESS HOMOPOLYMER DISTANCE FILES ----------
+
+## Get hp intervals that are closest to the probe intervals (dramatically speeds up downstream processing by subsetting to homopolymers near the probes)
+rule hp_bedtools_closest: 
+    input: 
+        hp_bed_file = homopolymer_bed_file, 
+        probe_bed_file = probe_bed_file,
+        fasta = fasta
+    output: 
+        hp_closest_probe_bed_file = "{output_dir}/exclusion_sites/hg38.homopolymers.closest_probes.bed.gz"
+    log:
+        "{output_dir}/logs/hp_bedtools_closest.log"
+    shell: 
+        """
+        echo "Identifying homopolymer intervals that are closest to probe intervals"
+        echo "HP bed file: {input.hp_bed_file}"
+        echo "Probe bed file: {input.probe_bed_file}"
+        echo "Fasta file: {input.fasta}"
+
+        bedtools closest -a <(zcat {input.hp_bed_file} | sort -k1,1 -k2,2n) -b <(cat {input.probe_bed_file} | sort -k1,1 -k2,2n) -D ref -t all | bgzip > {output.hp_closest_probe_bed_file}
+        """
+
+## Identify hp intervals that overlap probe intervals +/- 150bp flanks
+## Output is used for identifying variant distance to homopolymers + excluding homopolymers from PBR coverage calculations
+rule hp_overlapping_flanks: 
+    input: 
+        hp_closest_probe_bed_file = {rules.hp_bedtools_closest.output.hp_closest_probe_bed_file}
+    output: 
+        hp_overlapping_probe_flanks_bed_file = "{output_dir}/exclusion_sites/hg38.homopolymers.overlapping_probe_flanks.bed.gz",
+        hp_overlapping_probe_flanks_bed_file_indexed = "{output_dir}/exclusion_sites/hg38.homopolymers.overlapping_probe_flanks.bed.gz.tbi"
+    log: 
+        "{output_dir}/logs/hp_overlapping_flanks.log"
+    shell: 
+        """
+        echo "Identifying homopolymer intervals that overlap probe intervals +/- 150bp flanks"
+        echo "HP closest probe bed file: {input.hp_closest_probe_bed_file}"
+
+        # Columns: hp_chr, hp_start, hp_stop, hp_nucleotide, hp_length, interval_starth, interval_stop, gene, distance
+        zcat {input.hp_closest_probe_bed_file} | awk ' {{ if ($10 < 150 && $10 > -150 && $5 >= 4) print $0 }}' | awk -v FS='\t' -v OFS='\t' '!($6="")' | bgzip > {output.hp_overlapping_probe_flanks_bed_file}
+        tabix {output.hp_overlapping_probe_flanks_bed_file}
+        """
+
+ # ---------- GET VARIANT DISTANCES TO NEAREST HOMOPOLYMER ----------
+
+## Get BED file of distance between variants and homopolymers
+rule var_bedtools_closest: 
+    input: 
+        hp_bed_file = {rules.hp_overlapping_flanks.output.hp_overlapping_probe_flanks_bed_file}, 
+        vcf_file = {rules.vep_annotations.output.vep_annotated_vcf}
+    output: 
+        # Columns: var_chr, var_start, var_stop, hp_chr, hp_start, hp_stop, hp_nucleotide, hp_length, distance
+        var_hp_dist_bed = "{output_dir}/homopolymer/{sample}.var_hp_dist.bed.gz",
+        var_hp_dist_bed_indexed = "{output_dir}/homopolymer/{sample}.var_hp_dist.bed.gz.tbi"
+    log:
+        "{output_dir}/logs/{sample}.var_bedtools_closest.log"
+    shell: 
+        """
+        # module load bedtools/2.30.0
+        # module load bcftools/1.6
+        cd {wildcards.output_dir}/homopolymer
+
+        echo "Getting variant distances to nearest homopolymer"
+        echo "VCF file: {input.vcf_file}"
+        echo "HP file: {input.hp_bed_file}"
+
+        bedtools closest -a <(bcftools view -H {input.vcf_file} | cut -f 1-2 | awk '{{print $1"\t"$2-1"\t"$2}}' | sort -k1,1 -k2,2n) -b <(zcat {input.hp_bed_file}) -d -t first | awk -F '\t' 'BEGIN {{OFS = FS}} {{print $1, $2, $3, $4, $5, $6, $7, $8, $14}}' | sort -k1,1 -k2,2n | uniq | bgzip > {output.var_hp_dist_bed}
+        tabix {output.var_hp_dist_bed}
+        """
+
+# ---------- PROCESS FILES FOR PBR COVERAGE CALCULATIONS ----------
+
+## Run fraguracy (INFO) 
+## link: https://github.com/brentp/fraguracy
+rule run_fraguracy: 
+    input: 
+        probe_bed_file = probe_bed_file,
+        fasta = fasta
+    output: 
+        fraguracy_file = "{output_dir}/fraguracy/fraguracy-total-errors.bed",
+        fraguracy_bed = "{output_dir}/fraguracy/fraguracy-total-errors.bed.gz",
+        fraguracy_bed_indexed = "{output_dir}/fraguracy/fraguracy-total-errors.bed.gz.tbi"
+    log:
+        "{output_dir}/logs/run_fraguracy.log"
+    params: 
+        bam_dir = bam_dir,
+        bam_suffix = bam_suffix
+    shell: 
+        """
+        echo "Running fraguracy"
+        echo "BAM directory: {params.bam_dir}"
+        echo "Probe bed file: {input.probe_bed_file}"
+        echo "Fasta file: {input.fasta}"
+
+        cd {wildcards.output_dir}/fraguracy
+        /scratch/ucgd/lustre-labs/quinlan/u1240855/fastq_to_duplex_bam/workflow_process_duplex_bam/scripts/fraguracy extract --bin-size 1 -f {input.fasta} -r {input.probe_bed_file} {params.bam_dir}/*.{params.bam_suffix}
+        cat {output.fraguracy_file} | tail -n +2 | sort -k1,1 -k2,2n | bgzip > {output.fraguracy_bed}
+        tabix {output.fraguracy_bed}
+        """
+
+## Create exclusion sites for PBR
+rule create_exclusion_sites: 
+    input: 
+        fraguracy_bed = {rules.run_fraguracy.output.fraguracy_file},
+        homopolymer_bed = {rules.hp_overlapping_flanks.output.hp_overlapping_probe_flanks_bed_file}
+    output:
+        exclusion_sites_fraguracy = "{output_dir}/exclusion_sites/fraguracy_exclusion_sites.bed",
+        exclusion_sites_homopolymer = "{output_dir}/exclusion_sites/homopolymer_exclusion_sites.bed",
+        merged_exclusion_sites = "{output_dir}/exclusion_sites/merged_exclusion_sites.bed"
+    log: 
+        "{output_dir}/logs/create_exclusion_sites.log"
+    shell: 
+        """ 
+        echo "Creating exclusion sites for PBR coverage calculations"
+        echo "Fraguracy file: {input.fraguracy_bed}"
+        echo "Homopolymer file: {input.homopolymer_bed}"
+
+        ## Create exclusion sites for fraguracy
+        cat {input.fraguracy_bed} | tail -n +2 | awk '{{ if ( $5 > 3) print $0 }}' > {output.exclusion_sites_fraguracy}
+
+        ## Create exclusion sites for homopolymer (identify homopolymer intervals that are within a probe interval)
+        cat {input.homopolymer_bed} | tail -n +2 | awk '{{ if ( $9 == 0) print $0 }}' > {output.exclusion_sites_homopolymer}
+
+        ## Merge exclusion sites
+        cat <(cat {output.exclusion_sites_homopolymer} | cut -f 1-3) <(cat {output.exclusion_sites_fraguracy} | cut -f 1-3) | sort -k1,1 -k2,2n | bedtools merge -i - > {output.merged_exclusion_sites}
+        """
+
+## Filter panel BED file
+rule subset_panel: 
+    input: 
+        probe_bed_file = probe_bed_file,
+        exclusion_sites = {rules.create_exclusion_sites.output.merged_exclusion_sites}
+    output: 
+        subset_probe_bed_file = "{output_dir}/coverage/subset_panel.bed"
+    log:
+        "{output_dir}/logs/subset_panel.log"
+    shell: 
+        """
+        ## Subtract exclusion sites from panel BED file
+        bedtools subtract -a <(cat {input.probe_bed_file} | sort -k1,1 -k2,2n) -b {input.exclusion_sites} > {output.subset_probe_bed_file}
+        """  
+
+## Count nucleotide depth at each position in the specified panel BED file
+rule run_pbr: 
+    input: 
+        bam_file = bam_dir + "/{sample}." + bam_suffix,
+        probe_bed_file = probe_bed_file, 
+        subset_probe_bed_file = {rules.subset_panel.output.subset_probe_bed_file},
+        fasta=fasta
+    output: 
+        pbr_bed = "{output_dir}/coverage/pbr_files/{sample}.{probe}.{applied_filter}.{threshold}.nucleotide_count.annotated.bed.gz",
+        pbr_bed_indexed = "{output_dir}/coverage/pbr_files/{sample}.{probe}.{applied_filter}.{threshold}.nucleotide_count.annotated.bed.gz.tbi"
+    log: 
+        "{output_dir}/logs/{sample}.{probe}.{applied_filter}.{threshold}.run_pbr.log"
+    params: 
+        output_dir = output_dir        
+    shell: 
+        """
+        echo "Running PBR for {wildcards.sample} using probes = {wildcards.probe}, filter = {wildcards.applied_filter}, and threshold = {wildcards.threshold}"
+        /scratch/ucgd/lustre-labs/quinlan/u1240855/fastq_to_duplex_bam/workflow_process_duplex_bam/scripts/snakemake_run_pbr.sh \
+            -f {input.fasta} \
+            -s {wildcards.sample} \
+            -b {input.bam_file} \
+            -i {input.probe_bed_file} \
+            -u {input.subset_probe_bed_file} \
+            -p {wildcards.probe} \
+            -r {wildcards.applied_filter} \
+            -t {wildcards.threshold} \
+            -o {output.pbr_bed} \
+            -d {params.output_dir}
+        """
+    
+# ---------- RUN VCFANNO ----------
+
+# Annotate INFO and FORMAT fields for vardict VCF 
+rule create_vcfanno_config: 
+    input: 
+        vcf_file = {rules.vep_annotations.output.vep_annotated_vcf}, 
+        fraguracy_file = {rules.run_fraguracy.output.fraguracy_bed},
+        homopolymer_file = {rules.var_bedtools_closest.output.var_hp_dist_bed},
+        all_pbr = expand("{output_dir}/coverage/pbr_files/{sample}.{probe}.{applied_filter}.{threshold}.nucleotide_count.annotated.bed.gz", output_dir=output_dir, sample=samples, probe=probes, applied_filter=filters, threshold=thresholds),
+        nucleotide_count_file = "{output_dir}/coverage/pbr_files/{sample}.all_intervals.none_filters.baseline.nucleotide_count.annotated.bed.gz",
+        clinvar_vcf = clinvar_file
+    output: 
+        toml_file = "{output_dir}/fulcrum/{sample}.vcfanno_config.toml"
+    log: 
+        "{output_dir}/logs/{sample}.create_vcfanno_config.log"
+    shell: 
+        """
+        echo '[[annotation]]
+        file="{input.clinvar_vcf}"
+        fields=["CLNDN", "CLNSIG", "CLNREVSTAT", "CLNSIGCONF", "CLNVI"]
+        names=["CLNDN", "CLNSIG", "CLNREVSTAT", "CLNSIGCONF", "CLNVI"]
+        ops=["self", "self", "self", "self", "self"]
+        [[annotation]]
+        file="{input.nucleotide_count_file}"
+        columns=[4,5,6,7,8,9,10]
+        names=["pbr_ref", "pbr_depth", "a_count", "c_count", "g_count", "t_count", "n_count"]
+        ops=["self", "self", "self", "self", "self", "self", "self"] 
+        [[annotation]]
+        file="{input.homopolymer_file}"
+        columns=[4,5,6,7,8,9]
+        names=["hp_chr", "hp_start", "hp_stop", "hp_nucleotide", "hp_length", "hp_distance"]
+        ops=["self", "self", "self", "self", "self", "self"]
+        [[annotation]]
+        file="{input.fraguracy_file}"
+        columns=[5]
+        names=["fraguracy_errors"]
+        ops=["self"]' > {output.toml_file}
+        """
+
+## Run vcfanno
+rule run_vcfanno: 
+    input: 
+        vcf_file = {rules.vep_annotations.output.vep_annotated_vcf},
+        toml_file = {rules.create_vcfanno_config.output.toml_file}    
+    output: 
+        annotated_vcf = "{output_dir}/fulcrum/{sample}.vardict.annotated.vcf.gz",
+        annotated_vcf_indexed = "{output_dir}/fulcrum/{sample}.vardict.annotated.vcf.gz.tbi"
+    log: 
+        "{output_dir}/logs/{sample}.run_vcfanno.log"
+    shell: 
+        """
+        # module load vcfanno/0.3.5
+        cd {wildcards.output_dir}/fulcrum
+        echo {input.vcf_file}
+        echo {input.toml_file}
+        vcfanno -p 10 {input.toml_file} {input.vcf_file} | bgzip > {output.annotated_vcf}
+        tabix {output.annotated_vcf}
+        """
+
+# ---------- Filter variants and annotate with read and variant information ----------
+
+## Get variants found within the probe bed file
+rule get_variants_in_prob_intervals: 
+    input: 
+        vcf_file = {rules.run_vcfanno.output.annotated_vcf},
+        probe_bed_file = probe_bed_file
+    output: 
+        variants_in_probes = "{output_dir}/fulcrum/{sample}.vardict.annotated.in_probe_intervals.vcf.gz",
+        variants_in_probes_indexed = "{output_dir}/fulcrum/{sample}.vardict.annotated.in_probe_intervals.vcf.gz.tbi"
+    log: 
+        "{output_dir}/logs/{sample}.get_variants_in_probes.log"
+    shell: 
+        """
+        # module load bedtools/2.30.0
+        # module load bcftools/1.6
+        echo {input.vcf_file}
+        echo {input.probe_bed_file}
+        bedtools intersect -a {input.vcf_file} -b {input.probe_bed_file} -wa -header | bgzip > {output.variants_in_probes}
+        tabix {output.variants_in_probes}
+        """
+
+## Get mnv and indel coordinates from the vcf file
+rule get_mnv_indel_coords: 
+    input: 
+        vcf_file = {rules.get_variants_in_prob_intervals.output.variants_in_probes},
+        pbr_file = "{output_dir}/coverage/pbr_files/{sample}.all_intervals.none_filters.baseline.nucleotide_count.annotated.bed.gz"
+    output: 
+        mnv_indel_coords = "{output_dir}/tmp/{sample}.mnv_indel_coords.txt"
+    log: 
+        "{output_dir}/logs/{sample}.get_mnv_indel_coords.log"
+    script:
+        "/scratch/ucgd/lustre-labs/quinlan/u1240855/fastq_to_duplex_bam/workflow_process_duplex_bam/scripts/snakemake_get_mnv_indel_coords.py"
+
+## Get variant information (filters, true pysam depth, pae var status, etc.)
+rule pysam_var_reads: 
+    input: 
+        pae_variant_file = pae_variant_file,
+        fasta_file = fasta,
+        sample_unfiltered_pbr_file = "{output_dir}/coverage/pbr_files/{sample}.all_intervals.none_filters.baseline.nucleotide_count.annotated.bed.gz",
+        bam_file = bam_dir + "/{sample}." + bam_suffix, 
+        vcf_file = {rules.get_variants_in_prob_intervals.output.variants_in_probes}, 
+        mnv_indel_coords_file = {rules.get_mnv_indel_coords.output.mnv_indel_coords},
+        probe_bed_file = probe_bed_file
+    output: 
+        output_file = "{output_dir}/tmp/{sample}.pysam_processed.txt"
+    params: 
+        max_pysam_depth = 25,
+        flank_length = 3
+    log: 
+        "{output_dir}/logs/{sample}.pysam_process_var_reads.log"
+    script: 
+        "/scratch/ucgd/lustre-labs/quinlan/u1240855/fastq_to_duplex_bam/workflow_process_duplex_bam/scripts/snakemake_pysam_process_vars.py"
+
+# ---------- CREATE FINAL MUTATION FILES ----------
+
+## Combine mutations across samples from pysam processing
+rule combine_pysam_var_reads: 
+    input: 
+        metadata_file = {rules.process_sample_metadata.output.sample_metadata},
+        mutation_files = expand("{output_dir}/tmp/{sample}.pysam_processed.txt", output_dir=output_dir, sample=samples)    
+    output: 
+        combined_mutations = "{output_dir}/final/combined_mutations.txt"
+    log: 
+        "{output_dir}/logs/combine_pysam_files.log"
+    params:
+        mutation_file_dir = "{output_dir}/tmp",
+        samples = samples
+    script: 
+        "/scratch/ucgd/lustre-labs/quinlan/u1240855/fastq_to_duplex_bam/workflow_process_duplex_bam/scripts/snakemake_combine_mutation_files.py"
+
+## Measure recurrence in mutations
+rule measure_recurrence: 
+    input: 
+        mutation_file = {rules.combine_pysam_var_reads.output.combined_mutations}
+    output: 
+        recurrence_file = "{output_dir}/final/combined_mutations.with_recurrence.txt"
+    log:
+        "{output_dir}/logs/measure_recurrence.log"
+    resources: 
+        mem_mb = 128000        
+    script: 
+        "/scratch/ucgd/lustre-labs/quinlan/u1240855/fastq_to_duplex_bam/workflow_process_duplex_bam/scripts/snakemake_measure_recurrence.py"
+
+
+# ---------- CREATE FINAL COVERAGE FILES ----------
+
+## Final coverage file from aggregating sample pbr outputs
+rule combine_pbr: 
+    input: 
+        pbr_files = expand("{output_dir}/coverage/pbr_files/{sample}.{probe}.{applied_filter}.{threshold}.nucleotide_count.annotated.bed.gz", output_dir=output_dir, sample=samples, probe=probes, applied_filter=filters, threshold=thresholds), 
+        mutations = {rules.measure_recurrence.output.recurrence_file}
+    output: 
+        combined_pbr = "{output_dir}/final/combined_pbr_coverage.txt"
+    log:
+        "{output_dir}/logs/combine_pbr.log"
+    params: 
+        samples = samples, 
+        probes = probes,
+        filters = filters, 
+        thresholds = thresholds, 
+        pbr_dir = "{output_dir}/coverage/pbr_files"
+    resources: 
+        mem_mb = 12800  
+    script: 
+        "/scratch/ucgd/lustre-labs/quinlan/u1240855/fastq_to_duplex_bam/workflow_process_duplex_bam/scripts/snakemake_combine_pbr.py"
+
+rule combine_pbr_intervals: 
+    input: 
+        probe_bed_file = {rules.subset_panel.output.subset_probe_bed_file},
+        mutations = {rules.measure_recurrence.output.recurrence_file},
+        pbr_files = expand("{output_dir}/coverage/pbr_files/{sample}.{probe}.{applied_filter}.{threshold}.nucleotide_count.annotated.bed.gz", output_dir=output_dir, sample=samples, probe=probes, applied_filter=filters, threshold=thresholds)
+    output: 
+        output_file = "{output_dir}/final/combined_pbr_intervals.txt"
+    log: 
+        "{output_dir}/logs/combine_pbr_intervals.log"
+    params:
+        samples = samples,
+        pbr_dir = "{output_dir}/coverage/pbr_files"
+    script: 
+        "/scratch/ucgd/lustre-labs/quinlan/u1240855/fastq_to_duplex_bam/workflow_process_duplex_bam/scripts/snakemake_combine_pbr_by_interval.py"
+
+rule  get_ponytail_coverage:
+    input: 
+        pbr_files = expand("{output_dir}/coverage/pbr_files/{sample}.{probe}.{applied_filter}.{threshold}.nucleotide_count.annotated.bed.gz", output_dir=output_dir, sample=samples, probe=probes, applied_filter=filters, threshold=thresholds),
+        mutations = {rules.measure_recurrence.output.recurrence_file}
+    output: 
+        output_file = "{output_dir}/final/ponytail_coverage.txt"
+    log: 
+        "{output_dir}/logs/get_ponytail_coverage.log"
+    params: 
+        probes = probes, 
+        filters = filters,
+        thresholds = thresholds,
+        samples = samples,
+        pbr_dir = "{output_dir}/coverage/pbr_files"
+    resources: 
+        mem_mb = 128000,
+        tasks = 16
+    threads: 
+        32           
+    script:
+        "/scratch/ucgd/lustre-labs/quinlan/u1240855/fastq_to_duplex_bam/workflow_process_duplex_bam/scripts/snakemake_ponytail_coverage.py"        

@@ -1,0 +1,49 @@
+# Specify version
+## v10 used default vardict parameters
+## v11 used vardict parameters from TwinStrand + was used to generate the snakemake pipeline
+## v12 runs with the Java installation of vardict (v1.8.3) with TwinStrand parameters.
+## v13 runs on batch effect samples
+## v14 runs on downsampled BAMs
+## v15 runs on 19959R
+## v16 runs on all projects and remove ".1" sample suffix dependency, removes recurrent sites from the combine_pbr measurement
+## test is used for testing purposes
+# mkdir metadata
+# mkdir coverage
+# mkdir exclusion_sites
+# mkdir final
+# mkdir fraguracy
+# mkdir fulcrum
+# mkdir homopolymer
+# mkdir logs
+# mkdir tmp
+version: v16
+subdirs: [coverage, exclusion_sites, final, fraguracy, fulcrum, homopolymer, logs, tmp, alfred]
+
+# Sample manifest stores all of the needed information about samples
+experiment_metadata: /scratch/ucgd/lustre-labs/quinlan/u1240855/fastq_to_duplex_bam/experiment_metadata_v16.txt
+clinical_metadata: /scratch/ucgd/lustre-labs/quinlan/u1240855/fastq_to_duplex_bam/workflow_process_duplex_bam/data/clinical_metadata.txt
+
+## hg38 reference genome
+fasta: "/scratch/ucgd/lustre/common/data/Reference/GRCh38/human_g1k_v38_decoy_phix.fasta"
+
+# Output directories
+output_dir: /scratch/ucgd/lustre-labs/quinlan/u1240855/fastq_to_duplex_bam/workflow_process_duplex_bam/output
+
+# BAM directories:
+bam_dir: /scratch/ucgd/lustre-labs/quinlan/u1240855/fastq_to_duplex_bam/output/bams
+bam_suffix: mapped.bam
+
+# BED file of interval probes to detect variants/coverage from
+probe_bed_file: /scratch/ucgd/lustre-labs/quinlan/u1240855/fastq_to_duplex_bam/workflow_process_duplex_bam/data/combined_probe_intervals.bed
+
+# Variants showing evidence for selfish selection
+pae_variant_file: /scratch/ucgd/lustre-labs/quinlan/u1240855/fastq_to_duplex_bam/workflow_process_duplex_bam/data/pae_variants_hg38.txt
+
+# Homopolymer file
+## cd /scratch/ucgd/lustre-labs/quinlan/u1240855/fastq_to_duplex_bam/workflow_process_duplex_bam/data
+## zcat hg38.homopolymers.bed.gz | grep -v "_" | egrep "^chr[0-9XY]" | bgzip > hg38.homopolymers.subset_chr.bed.gz
+## tabix hg38.homopolymers.subset_chr.bed.gz
+homopolymer_bed_file: /scratch/ucgd/lustre-labs/quinlan/u1240855/fastq_to_duplex_bam/workflow_process_duplex_bam/data/hg38.homopolymers.subset_chr.bed.gz
+
+## ClinVar file
+clinvar_file: /scratch/ucgd/lustre-labs/quinlan/u1240855/fastq_to_duplex_bam/workflow_process_duplex_bam/data/clinvar_20240127.vcf.gz
